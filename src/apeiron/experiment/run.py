@@ -1,0 +1,110 @@
+"""Run directories: one bounded directory per run, holding every output.
+
+Layout under the experiment workspace (``[experiment] path``)::
+
+    <path>/
+        runs/
+            run_0001/
+                config/
+                    original/<name>.toml   # raw config text as given
+                    resolved.json          # post-derivation frozen config
+                journal.sqlite             # event journal (apeiron.experiment.Journal)
+                metrics.csv                # logger CSV, redirected here
+                checkpoints/               # model.ckpts_path, redirected here
+
+Creating a :class:`Run` allocates the directory; :meth:`Run.bind` returns a
+new frozen ``Config`` whose output paths all point inside it, so the rest of
+the pipeline needs no knowledge of experiment mode. Without an
+``[experiment]`` config section nothing here is used and apeiron behaves
+exactly as before.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Optional
+
+from apeiron.config.configuration import Config, LoggingCfg
+from apeiron.experiment.journal import Journal
+
+
+class Run:
+    """A single run's bounded directory plus its journal."""
+
+    def __init__(self, run_dir: Path, journal: Journal):
+        self.run_dir = run_dir
+        self.journal = journal
+
+    # ----- construction -----
+
+    @classmethod
+    def create(cls, cfg: Config, original_config: Optional[str | Path] = None) -> "Run":
+        """Allocate the next run directory and record run_started.
+
+        :param cfg: resolved config; ``cfg.experiment`` must be set.
+        :param original_config: path of the TOML the run was launched with;
+            its raw text (comments included) is preserved under ``config/original/``.
+        """
+        assert cfg.experiment is not None, "Run.create requires [experiment] config"
+        runs_root = Path(cfg.experiment.path) / "runs"
+        runs_root.mkdir(parents=True, exist_ok=True)
+
+        name = cfg.experiment.run_name or cls._next_run_name(runs_root)
+        run_dir = runs_root / name
+        run_dir.mkdir(parents=True, exist_ok=False)
+        (run_dir / "config" / "original").mkdir(parents=True)
+        (run_dir / "checkpoints").mkdir()
+
+        resolved = json.dumps(asdict(cfg), indent=2)
+        (run_dir / "config" / "resolved.json").write_text(resolved)
+        if original_config is not None:
+            src = Path(original_config)
+            (run_dir / "config" / "original" / src.name).write_text(src.read_text())
+
+        journal = Journal(run_dir / "journal.sqlite")
+        journal.record(
+            "run_started",
+            run_name=name,
+            config_sha256=hashlib.sha256(resolved.encode()).hexdigest(),
+            original_config=str(original_config) if original_config else None,
+        )
+        return cls(run_dir=run_dir, journal=journal)
+
+    @staticmethod
+    def _next_run_name(runs_root: Path) -> str:
+        taken = {p.name for p in runs_root.iterdir() if p.is_dir()}
+        i = 1
+        while f"run_{i:04d}" in taken:
+            i += 1
+        return f"run_{i:04d}"
+
+    # ----- config binding -----
+
+    def bind(self, cfg: Config) -> Config:
+        """Return a config whose output paths all point inside the run dir.
+
+        - ``logging.metrics_output_path`` -> ``<run>/metrics.csv`` (a logging
+          section is created if the config had none, preserving the default
+          backend, so an experiment run always records its metrics).
+        - ``model.ckpts_path`` -> ``<run>/checkpoints`` (enable by setting
+          ``model.max_ckpts > 0`` as before).
+        """
+        logging_cfg = cfg.logging or LoggingCfg(backend="wandb")
+        logging_cfg = dataclasses.replace(
+            logging_cfg, metrics_output_path=str(self.run_dir / "metrics.csv")
+        )
+        model_cfg = dataclasses.replace(
+            cfg.model, ckpts_path=str(self.run_dir / "checkpoints")
+        )
+        return dataclasses.replace(cfg, logging=logging_cfg, model=model_cfg)
+
+    # ----- lifecycle -----
+
+    def finish(self, exit_code: int = 0) -> None:
+        """Record run_finished and close the journal."""
+        self.journal.record("run_finished", exit_code=exit_code)
+        self.journal.close()

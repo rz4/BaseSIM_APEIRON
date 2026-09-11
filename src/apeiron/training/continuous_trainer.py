@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,6 +13,9 @@ from apeiron.profilers import FLOPSProfiler
 from apeiron.training.updater.create_updater import create_updater
 from apeiron.logger import get_logger
 
+if TYPE_CHECKING:
+    from apeiron.experiment.journal import Journal
+
 
 class ContinuousTrainer:
     """Trainer for continuous/continual learning with drift handling."""
@@ -23,11 +26,13 @@ class ContinuousTrainer:
         modelHarness: BaseModelHarness,
         logger: Any,
         profiler: Optional[FLOPSProfiler],
+        journal: "Journal | None" = None,
     ) -> None:
         """Initialize the continuous trainer with config, model, logger, and profiler."""
         self.modelHarness = modelHarness
         self.cfg = cfg
         self.logger = logger
+        self.journal = journal
 
         self.profiler = profiler
         self.criterion = modelHarness.get_criterion()
@@ -140,6 +145,15 @@ class ContinuousTrainer:
         # it. Kept for the FWT delta once the post-CL score (R[i][i]) is in.
         pre_cl_validation_metrics = cur_validation_metrics
 
+        if self.journal is not None:
+            self.journal.record(
+                "cl_started",
+                drift_event_id=drift_event_id,
+                update_mode=self.cfg.continual_learning.update_mode,
+                pre_cur_metrics=cur_validation_metrics,
+                pre_hist_metrics=hist_validation_metrics,
+            )
+
         logger.info("==== Continual Learning ====")
         logger.info("\tInitial test acc: {}".format(cur_validation_metrics[0]), level=1)
         if hist_validation_metrics is not None:
@@ -221,6 +235,17 @@ class ContinuousTrainer:
         if bwt is not None:
             eval_metrics["bwt"] = bwt
         logger.log(eval_metrics, commit=False)
+
+        if self.journal is not None:
+            self.journal.record(
+                "cl_finished",
+                drift_event_id=drift_event_id,
+                iterations=iter_count + 1,
+                post_cur_metrics=cur_validation_metrics,
+                post_hist_metrics=hist_validation_metrics,
+                fwt=fwt,
+                bwt=bwt,
+            )
 
         # Register *after* BWT so this event's window becomes task T only for
         # subsequent events -- R[T][T] belongs on the diagonal, not in the sum.

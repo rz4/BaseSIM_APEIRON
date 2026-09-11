@@ -183,6 +183,20 @@ class DriftDetectionCfg:
 
 
 @dataclass(frozen=True)
+class ExperimentCfg:
+    """Bounded run directories (see docs/experiment.md).
+
+    When this section is present, every run allocates a directory under
+    ``<path>/runs/`` and all outputs -- resolved config, metrics CSV, event
+    journal, checkpoints -- are written inside it. Absent section = legacy
+    behavior (outputs scattered in the working directory).
+    """
+
+    path: str  # experiment workspace directory
+    run_name: str = ""  # optional; auto-numbered (run_0001, ...) when empty
+
+
+@dataclass(frozen=True)
 class LoggingCfg:
     backend: MetricsBackend = "none"  # "wandb", "mlflow", or "none"
     experiment_name: str | None = (
@@ -205,6 +219,7 @@ class Config:
     multi_gpu: bool = False
     verbosity: str = "INFO"
     logging: LoggingCfg | None = None
+    experiment: ExperimentCfg | None = None
 
 
 def parse_args(argv=None):
@@ -358,6 +373,7 @@ def build_config(argv=None) -> Config:
     dd = DriftDetectionCfg(**cfg["drift_detection"])
     cl = ContinualLearningCfg(**cfg.get("continual_learning", {}))
     log_cfg = LoggingCfg(**cfg["logging"]) if "logging" in cfg else None
+    exp_cfg = ExperimentCfg(**cfg["experiment"]) if "experiment" in cfg else None
 
     raw_device = str(
         cfg.get(
@@ -380,6 +396,7 @@ def build_config(argv=None) -> Config:
         "continual_learning",
         "drift_detection",
         "logging",
+        "experiment",
         "device",
         "multi_gpu",
     }
@@ -394,10 +411,14 @@ def build_config(argv=None) -> Config:
         continual_learning=cl,
         drift_detection=dd,
         logging=log_cfg,
+        experiment=exp_cfg,
         device=resolved_device,
         multi_gpu=multi_gpu_flag,
         **extras,
     )
 
-    Path("resolved_config.json").write_text(json.dumps(asdict(final), indent=2))
+    # Experiment mode writes the resolved config inside the run directory
+    # instead (apeiron.experiment.Run); only legacy runs dump it in the CWD.
+    if final.experiment is None:
+        Path("resolved_config.json").write_text(json.dumps(asdict(final), indent=2))
     return final

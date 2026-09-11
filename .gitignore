@@ -235,3 +235,4 @@ __marimo__/
 # Run artifacts (config dumps, metrics CSVs, checkpoints)
 output/
 resolved_config.json
+experiments/

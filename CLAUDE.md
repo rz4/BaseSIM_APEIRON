@@ -38,16 +38,18 @@ The installable package lives under `src/apeiron/` (imported as `apeiron`; see `
 7. **Evaluation** (`src/apeiron/evaluation/metrics.py`): `accuracy()` and `accuracy_topk()`.
 8. **Logger** (`src/apeiron/logger/`): `Logger` with pluggable metrics backends -- `WandBLogger` and `MLFlowLogger` (configured via `[logging] backend = "wandb"|"mlflow"|"none"`), plus console output. Stages: eval, drift, cl. Metrics are written to a CSV file at `[logging] metrics_output_path` for external analysis.
 9. **Profilers** (`src/apeiron/profilers/`): `FLOPSProfiler` (`count_flops.py`) using PyTorch FlopCounterMode.
+10. **Experiment runs** (`src/apeiron/experiment/`): `Run` (bounded run directories under `[experiment] path`/runs/ holding resolved+original config, metrics CSV, checkpoints) and `Journal` (append-only SQLite event log: window advances, every drift check unsampled, drift events, CL rounds with FWT/BWT, checkpoints). Config-gated: no `[experiment]` section = legacy behavior. See `docs/experiment.md`.
 
 ### Example Harnesses
 - `examples/mnist/model.py`: `MNIST_CNN` -- CNN on MNIST with affine drift simulation.
 - `examples/cifar/model.py`: `CIFAR_VISION` -- ViT/VGG on CIFAR-10 with affine drift.
 - `examples/imagenet/model.py`: `IMAGENET_VISION` -- ViT on ImageNet with affine drift.
+- `examples/well/model.py`: `WELL_FNO` -- The Well (PolymathicAI) pretrained FNO under real physical regime drift (one regime window per HDF5 file of the parameter sweep). `data.name = "well:<dataset>"`.
 - `examples/utils.py`: `get_example(cfg)` factory dispatching on `cfg.data.name`.
 
 ### Configuration Format (TOML)
 Required sections: `[model]` (name, pretrained_path), `[data]` (name, path), `[train]` (batch_size, num_workers, init_lr), `[drift_detection]` (detector_name, detection_interval, etc).
-Optional sections: `[continual_learning]` (update_mode, lambda params), `[logging]` (backend = "wandb"|"mlflow"|"none", experiment_name, mlflow_tracking_uri, metrics_output_path).
+Optional sections: `[continual_learning]` (update_mode, lambda params), `[logging]` (backend = "wandb"|"mlflow"|"none", experiment_name, mlflow_tracking_uri, metrics_output_path), `[experiment]` (path, run_name -- bounded run directories + event journal).
 Top-level keys: `seed`, `device` ("auto"|"cpu"|"cuda"|"mps"), `multi_gpu`.
 
 ### Available Drift Detectors
