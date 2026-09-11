@@ -18,6 +18,7 @@ channels-first layout (``x: [B, T_in*C(+const), H, W]``, ``y: [B, T_out*C, H, W]
 so the rest of apeiron (monitor, trainer, updaters) sees ordinary tuples.
 """
 
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -27,6 +28,7 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset
 
 from apeiron.config.configuration import Config
+from apeiron.experiment.determinism import window_generator
 from apeiron.model.torch_model_harness import BaseModelHarness
 
 # The pretrained Well FNO baselines consume 4 input steps and predict 1 step
@@ -96,6 +98,7 @@ class WELL_FNO(BaseModelHarness):
         print(f"Well regimes ({len(self.regimes)}): {self.regimes}")
 
         self.task_counter = 0
+        self.current_window_fingerprint: Optional[str] = None
         self._cur_train_loader: Optional[DataLoader] = None
         self._cur_val_loader: Optional[DataLoader] = None
         self._cur_stream_loader: Optional[DataLoader] = None
@@ -162,15 +165,45 @@ class WELL_FNO(BaseModelHarness):
             n_steps_output=N_STEPS_OUTPUT,
         )
 
-    def _make_loader(self, ds: Dataset, batch_size: int, shuffle: bool) -> DataLoader:
+    def _make_loader(
+        self, ds: Dataset, batch_size: int, shuffle: bool, role: str = ""
+    ) -> DataLoader:
+        # Shuffles are seeded per (run seed, window, role) so batch order is
+        # a pure function of the config -- the determinism contract that
+        # makes reruns byte-identical and continues replayable.
+        generator = (
+            window_generator(self.cfg.seed, self.task_counter, role)
+            if shuffle
+            else None
+        )
         return DataLoader(
             ds,
             batch_size=batch_size,
             shuffle=shuffle,
+            generator=generator,
             num_workers=self.cfg.train.num_workers,
             collate_fn=well_collate,
             drop_last=False,
         )
+
+    def _window_fingerprint(self, regime: str) -> str:
+        """Identity fingerprint of a window's data: file names + sizes.
+
+        Content-level hashing arrives with the artifact store; this is the
+        cheap identity check recorded in the journal per window.
+        """
+        import fsspec
+
+        entries = []
+        for split in ("train", "valid"):
+            path = f"{self.base_path.rstrip('/')}/{self.dataset_name}/data/{split}"
+            fs, _ = fsspec.url_to_fs(path)
+            for f in sorted(fs.glob(f"{path}/*{regime}*")):
+                info = fs.info(f)
+                entries.append((split, f.rsplit("/", 1)[-1], info.get("size")))
+        return hashlib.sha256(
+            repr((self.dataset_name, regime, entries)).encode()
+        ).hexdigest()
 
     # ----- stream protocol -----
 
@@ -178,18 +211,19 @@ class WELL_FNO(BaseModelHarness):
         regime_idx = min(self.task_counter, len(self.regimes) - 1)
         regime = self.regimes[regime_idx]
         print(f"Well stream -> regime {regime_idx}: {regime}")
+        self.current_window_fingerprint = self._window_fingerprint(regime)
 
         ds_train = self._make_dataset("train", include=[regime])
         ds_val = self._make_dataset("valid", include=[regime])
 
         self._cur_train_loader = self._make_loader(
-            ds_train, self.cfg.train.batch_size, shuffle=True
+            ds_train, self.cfg.train.batch_size, shuffle=True, role="train"
         )
         self._cur_val_loader = self._make_loader(
             ds_val, self.cfg.train.batch_size, shuffle=False
         )
         self._cur_stream_loader = self._make_loader(
-            ds_val, self.cfg.data.batch_size, shuffle=True
+            ds_val, self.cfg.data.batch_size, shuffle=True, role="stream"
         )
         self.task_counter += 1
 
@@ -213,7 +247,9 @@ class WELL_FNO(BaseModelHarness):
         hist_train = self._make_dataset("train", include=prior)
         hist_val = self._make_dataset("valid", include=prior)
         return (
-            self._make_loader(hist_train, self.cfg.train.batch_size, shuffle=True),
+            self._make_loader(
+                hist_train, self.cfg.train.batch_size, shuffle=True, role="hist"
+            ),
             self._make_loader(hist_val, self.cfg.train.batch_size, shuffle=False),
         )
 

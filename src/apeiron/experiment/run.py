@@ -69,10 +69,48 @@ class Run:
         journal.record(
             "run_started",
             run_name=name,
-            config_sha256=hashlib.sha256(resolved.encode()).hexdigest(),
+            config_sha256=cls._behavior_config_hash(cfg),
             original_config=str(original_config) if original_config else None,
         )
         return cls(run_dir=run_dir, journal=journal)
+
+    @staticmethod
+    def _behavior_config_hash(cfg: Config) -> str:
+        """Hash of the config fields that determine run behavior.
+
+        The ``[experiment]`` section is allocation metadata (workspace path,
+        run name) -- two reruns of the same experiment legitimately differ
+        there, so it is excluded. This keeps journal signatures equal across
+        reruns while still catching any behavioral config change.
+        """
+        d = asdict(cfg)
+        d.pop("experiment", None)
+        return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+    @classmethod
+    def open(cls, run_dir: str | Path) -> "Run":
+        """Reopen an existing run directory (for continuing a run).
+
+        The journal is appended to; nothing is recorded here -- the caller
+        records its own ``run_continued`` event with whatever state it
+        restored.
+        """
+        run_dir = Path(run_dir)
+        journal_path = run_dir / "journal.sqlite"
+        assert journal_path.exists(), f"No journal at {journal_path}; not a run dir"
+        return cls(run_dir=run_dir, journal=Journal(journal_path))
+
+    def resolved_config(self) -> dict:
+        """The run's resolved config, as written at creation time."""
+        return json.loads((self.run_dir / "config" / "resolved.json").read_text())
+
+    @property
+    def latest_checkpoint(self) -> Optional[Path]:
+        """Path of the newest checkpoint, or None if none was saved."""
+        pointer = self.run_dir / "checkpoints" / "latest"
+        if not pointer.exists():
+            return None
+        return self.run_dir / "checkpoints" / pointer.read_text().strip()
 
     @staticmethod
     def _next_run_name(runs_root: Path) -> str:

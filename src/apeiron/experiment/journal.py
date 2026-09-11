@@ -14,6 +14,7 @@ Query with any SQLite client, e.g.::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -75,6 +76,50 @@ class Journal:
             }
             for r in rows
         ]
+
+    # Payload keys that legitimately differ between reruns of the same
+    # experiment (allocation-dependent, not behavior-dependent).
+    VOLATILE_KEYS = frozenset({"run_name", "original_config", "path"})
+
+    def signature(self) -> str:
+        """Content hash of the run's behavior, for rerun comparison.
+
+        Two runs of the same config on the same data should produce equal
+        signatures (the determinism contract). Wall-clock timestamps, row
+        ids, and allocation-dependent payload keys (run/checkpoint paths)
+        are excluded; everything else -- event order, kinds, batch counts,
+        metrics, drift decisions -- is included.
+        """
+        h = hashlib.sha256()
+        for e in self.events():
+            payload = {
+                k: e[k]
+                for k in sorted(e)
+                if k not in ("id", "ts") and k not in self.VOLATILE_KEYS
+            }
+            h.update(json.dumps(payload, sort_keys=True, default=str).encode())
+            h.update(b"\x1e")
+        return h.hexdigest()
+
+    def resume_state(self) -> dict[str, int]:
+        """Counters needed to continue a run from its journal tail.
+
+        Returns ``stream_update_count`` (last window started),
+        ``batch_count`` (last recorded), and ``drift_event_count`` (last
+        drift event id, 0 if none).
+        """
+        windows = self.events(kind="window_started")
+        drifts = self.events(kind="drift_detected")
+        batch_counts = [
+            e["batch_count"] for e in self.events() if e.get("batch_count") is not None
+        ]
+        return {
+            "stream_update_count": (
+                windows[-1]["stream_update_count"] if windows else 0
+            ),
+            "batch_count": max(batch_counts) if batch_counts else 0,
+            "drift_event_count": (drifts[-1]["drift_event_id"] if drifts else 0),
+        }
 
     def close(self) -> None:
         self._conn.close()

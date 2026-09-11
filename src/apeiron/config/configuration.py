@@ -237,7 +237,15 @@ def parse_args(argv=None):
         The parsed command line arguments.
     """
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, required=True)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--config", type=Path)
+    group.add_argument(
+        "--continue-from",
+        type=Path,
+        dest="continue_from",
+        help="Existing run directory to continue (experiment mode); the run's "
+        "resolved config is reused, with --set overrides applied on top",
+    )
     p.add_argument("--set", action="append", default=[], help="key=val, repeatable")
     p.add_argument(
         "--device",
@@ -348,6 +356,43 @@ def env_overrides(prefix="APP_") -> dict[str, Any]:
     return kv_to_nested(items)
 
 
+def config_from_dict(cfg: dict[str, Any]) -> Config:
+    """Rebuild a frozen ``Config`` from an already-resolved config dict.
+
+    Used to continue a run from its ``config/resolved.json``: no TOML, env,
+    or CLI merging, and the device string is taken as-is (it was resolved
+    when the run was created).
+    """
+    known = {f.name for f in _dc.fields(Config)}
+    extras = {
+        k: v
+        for k, v in cfg.items()
+        if k in known
+        and k
+        not in {
+            "model",
+            "data",
+            "train",
+            "continual_learning",
+            "drift_detection",
+            "logging",
+            "experiment",
+        }
+    }
+    return Config(
+        model=ModelCfg(**cfg["model"]),
+        data=DataCfg(**cfg["data"]),
+        train=TrainCfg(**cfg["train"]),
+        continual_learning=ContinualLearningCfg(**cfg.get("continual_learning") or {}),
+        drift_detection=DriftDetectionCfg(**cfg["drift_detection"]),
+        logging=LoggingCfg(**cfg["logging"]) if cfg.get("logging") else None,
+        experiment=ExperimentCfg(**cfg["experiment"])
+        if cfg.get("experiment")
+        else None,
+        **extras,
+    )
+
+
 def build_config(argv=None) -> Config:
     """
     Load configuration from TOML file, environment variables, and command line arguments.
@@ -363,6 +408,10 @@ def build_config(argv=None) -> Config:
         The final configuration.
     """
     args = parse_args(argv)
+    assert args.config is not None, (
+        "build_config requires --config; --continue-from runs rebuild their "
+        "config via config_from_dict (see src/main.py)"
+    )
     cfg = load_toml(args.config)
     cfg = deep_update(cfg, env_overrides("APP_"))
     cfg = deep_update(cfg, kv_to_nested(args.set))
