@@ -231,3 +231,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Run artifacts (config dumps, metrics CSVs, checkpoints)
+output/
+resolved_config.json
