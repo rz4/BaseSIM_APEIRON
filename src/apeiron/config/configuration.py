@@ -194,6 +194,10 @@ class ExperimentCfg:
 
     path: str  # experiment workspace directory
     run_name: str = ""  # optional; auto-numbered (run_0001, ...) when empty
+    # Soft byte budget for the experiment's artifact store (the local disk
+    # tier of managed data residency); 0 = unlimited. Pinned artifacts are
+    # never evicted, so pins may exceed the budget with a warning.
+    artifact_budget_bytes: int = 0
 
 
 @dataclass(frozen=True)

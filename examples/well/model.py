@@ -19,6 +19,7 @@ so the rest of apeiron (monitor, trainer, updaters) sees ordinary tuples.
 """
 
 import hashlib
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -28,6 +29,12 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset
 
 from apeiron.config.configuration import Config
+from apeiron.experiment import (
+    ArtifactStore,
+    RemoteObject,
+    ResidencyManager,
+    get_source,
+)
 from apeiron.experiment.determinism import window_generator
 from apeiron.model.torch_model_harness import BaseModelHarness
 
@@ -94,7 +101,34 @@ class WELL_FNO(BaseModelHarness):
         self.dataset_name = cfg.data.name.split(":", 1)[1]
         self.base_path = cfg.data.path
 
-        self.regimes = self._discover_regimes()
+        # Managed residency: with an [experiment] section and an hf:// data
+        # path, regime files are materialized on demand into the experiment's
+        # artifact store (pinned for this run, next window prefetched) and
+        # WellDataset reads local files. Without it: hf:// streams remotely,
+        # local paths read directly -- the pre-M4 behaviors, unchanged.
+        self.managed = cfg.experiment is not None and self.base_path.startswith("hf://")
+        if self.managed:
+            assert cfg.experiment is not None
+            store = ArtifactStore(Path(cfg.experiment.path) / "artifacts")
+            self._residency: Optional[ResidencyManager] = ResidencyManager(
+                store, budget_bytes=cfg.experiment.artifact_budget_bytes
+            )
+            self._pin_owner = cfg.experiment.run_name or "unnamed-run"
+            dataset_uri = f"{self.base_path.rstrip('/')}/{self.dataset_name}"
+            self._objects = get_source(dataset_uri).list(dataset_uri)
+            org = self.base_path.rstrip("/").rsplit("/", 1)[-1]
+            self._effective_base = str(store.store_root / "datasets" / org)
+            self.regimes = sorted(
+                {
+                    o.relpath.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                    for o in self._objects
+                    if "/data/train/" in o.relpath
+                }
+            )
+        else:
+            self._residency = None
+            self._effective_base = self.base_path
+            self.regimes = self._discover_regimes()
         print(f"Well regimes ({len(self.regimes)}): {self.regimes}")
 
         self.task_counter = 0
@@ -155,7 +189,7 @@ class WELL_FNO(BaseModelHarness):
         from the_well.data.normalization import ZScoreNormalization
 
         return WellDataset(
-            well_base_path=self.base_path,
+            well_base_path=self._effective_base,
             well_dataset_name=self.dataset_name,
             well_split_name=split,
             include_filters=include,
@@ -205,13 +239,43 @@ class WELL_FNO(BaseModelHarness):
             repr((self.dataset_name, regime, entries)).encode()
         ).hexdigest()
 
+    # ----- residency -----
+
+    def _regime_objects(self, regime: str) -> List[RemoteObject]:
+        """The reservoir objects one regime window needs (data + stats.yaml)."""
+        return [
+            o
+            for o in self._objects
+            if o.relpath.endswith(f"/{regime}.hdf5")
+            or o.relpath.endswith(f"/{regime}.h5")
+            or o.relpath.endswith(f"/{self.dataset_name}/stats.yaml")
+        ]
+
+    def _managed_fingerprint(self, regime: str) -> str:
+        """Content identity from the reservoir listing (names, sizes, sha256)."""
+        entries = sorted(
+            (o.relpath, o.size, o.sha256) for o in self._regime_objects(regime)
+        )
+        return hashlib.sha256(
+            repr((self.dataset_name, regime, entries)).encode()
+        ).hexdigest()
+
     # ----- stream protocol -----
 
     def update_data_stream(self) -> None:
         regime_idx = min(self.task_counter, len(self.regimes) - 1)
         regime = self.regimes[regime_idx]
         print(f"Well stream -> regime {regime_idx}: {regime}")
-        self.current_window_fingerprint = self._window_fingerprint(regime)
+
+        if self._residency is not None:
+            self._residency.ensure(self._regime_objects(regime), self._pin_owner)
+            if regime_idx + 1 < len(self.regimes):
+                self._residency.prefetch(
+                    self._regime_objects(self.regimes[regime_idx + 1])
+                )
+            self.current_window_fingerprint = self._managed_fingerprint(regime)
+        else:
+            self.current_window_fingerprint = self._window_fingerprint(regime)
 
         ds_train = self._make_dataset("train", include=[regime])
         ds_val = self._make_dataset("valid", include=[regime])
