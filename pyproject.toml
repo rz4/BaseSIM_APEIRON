@@ -25,7 +25,8 @@ dependencies = [
     "transformers (>=5.0.0)",
     "river (>=0.21.0,<0.24.0)",
     "evidently (>=0.4.0,<0.8.0)",
-    "matplotlib (>=3.10.7,<4.0.0)"
+    "matplotlib (>=3.10.7,<4.0.0)",
+    "the-well (>=1.2.0,<2.0.0)"
 ]
 
 [dependency-groups]
@@ -63,8 +64,12 @@ ignore_missing_imports = true
 module = "mlflow.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["the_well.*", "fsspec.*", "einops.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
