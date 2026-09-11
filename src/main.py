@@ -1,7 +1,8 @@
 import sys
 
 from apeiron.logger import get_logger, configure_backend
-from apeiron.config.configuration import build_config, Config
+from apeiron.config.configuration import build_config, parse_args, Config
+from apeiron.experiment import Run
 
 from examples.utils import get_example
 
@@ -10,6 +11,14 @@ from apeiron.driver.continuous_monitor import ContinuousMonitor
 
 def main(argv: list[str] | None = None) -> int:
     cfg: Config = build_config(argv)
+
+    # Experiment mode: allocate the bounded run directory and rebind all
+    # output paths into it BEFORE the logger is constructed (the CSV path is
+    # fixed at logger creation).
+    run: Run | None = None
+    if cfg.experiment is not None:
+        run = Run.create(cfg, original_config=parse_args(argv).config)
+        cfg = run.bind(cfg)
 
     # Must precede get_example(): get_logger() ignores its arguments once an
     # instance exists, so a harness that logs from __init__ would pin the config.
@@ -33,12 +42,16 @@ def main(argv: list[str] | None = None) -> int:
     monitor = ContinuousMonitor(
         cfg=cfg,
         modelHarness=modelHarness,
+        journal=run.journal if run else None,
     )
 
     # Run continuous monitoring
     monitor.run()
 
     # TODO: Save a model checkpoint
+
+    if run is not None:
+        run.finish()
 
     logger.finish()
 

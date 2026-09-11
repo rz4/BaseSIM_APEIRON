@@ -23,6 +23,7 @@ from apeiron.training import ContinuousTrainer
 from tqdm import tqdm
 
 if TYPE_CHECKING:
+    from apeiron.experiment.journal import Journal
     from apeiron.model.torch_model_harness import BaseModelHarness
 
 
@@ -49,16 +50,20 @@ class ContinuousMonitor:
         self,
         cfg: Config,
         modelHarness: BaseModelHarness,
+        journal: "Journal | None" = None,
     ):
         """Initialize continuous monitor.
 
         Args:
             cfg: Configuration object
             modelHarness: Model harness containing model and data loaders
-            logger: Logger for metrics
+            journal: Optional run event journal (experiment mode); every
+                window advance, drift check, drift event, and checkpoint is
+                recorded when present.
         """
         self.cfg = cfg
         self.modelHarness = modelHarness
+        self.journal = journal
         self.logger = get_logger()
 
         # Create persistent detector instance
@@ -73,6 +78,7 @@ class ContinuousMonitor:
             modelHarness=self.modelHarness,
             logger=self.logger,
             profiler=self.flops_profiler,
+            journal=self.journal,
         )
 
         # Configuration
@@ -110,6 +116,7 @@ class ContinuousMonitor:
         # Initialize first data stream
         self.logger.info("\tInitializing first data stream...", level=1)
         self.modelHarness.update_data_stream()
+        self._journal_window()
 
         while not self._should_stop():
             try:
@@ -250,6 +257,17 @@ class ContinuousMonitor:
         # Log drift metrics
         self._log_metrics(drift_signal, agg_metric)
 
+        # Journal every check unsampled (the CSV subsamples detected=0 rows)
+        if self.journal is not None:
+            self.journal.record(
+                "drift_check",
+                batch_count=self.batch_count,
+                metric=agg_metric,
+                score=drift_signal.drift_score,
+                detected=drift_signal.drift_detected,
+                regime=drift_signal.regime.value if drift_signal.regime else None,
+            )
+
         return drift_signal
 
     def _handle_drift(self, drift_signal: DriftSignal) -> None:
@@ -284,6 +302,17 @@ class ContinuousMonitor:
         # Log profiler performance summary
         self.flops_profiler.print_performance(logger=self.logger, level=2)
 
+        if self.journal is not None:
+            self.journal.record(
+                "drift_detected",
+                batch_count=self.batch_count,
+                drift_event_id=self.drift_event_count,
+                score=drift_signal.drift_score,
+                regime=drift_signal.regime.value if drift_signal.regime else None,
+                confidence=drift_signal.confidence,
+                stream_update_count=self.stream_update_count,
+            )
+
         self.logger.info("-> Dispatching continual learning module...", level=0)
 
         # PAUSE monitoring, dispatch learning module
@@ -294,6 +323,13 @@ class ContinuousMonitor:
         if self.modelHarness.ckpts_enabled:
             ckptpath = self.modelHarness.save_ckpt(event=self.drift_event_count)
             self.logger.info(f"* Checkpoint saved to: {ckptpath}", level=0)
+            if self.journal is not None:
+                self.journal.record(
+                    "checkpoint_saved",
+                    batch_count=self.batch_count,
+                    drift_event_id=self.drift_event_count,
+                    path=ckptpath,
+                )
 
         self.logger.info("<- Continual learning complete.", level=0)
 
@@ -320,6 +356,20 @@ class ContinuousMonitor:
 
         # Load next data buffer
         self.modelHarness.update_data_stream()
+        self._journal_window()
+
+    def _journal_window(self) -> None:
+        """Record a window advance, including harness window info if exposed."""
+        if self.journal is None:
+            return
+        timerange = getattr(self.modelHarness, "current_window_timerange", None)
+        self.journal.record(
+            "window_started",
+            batch_count=self.batch_count,
+            stream_update_count=self.stream_update_count,
+            data_time_start=timerange[0] if timerange else None,
+            data_time_end=timerange[1] if timerange else None,
+        )
 
     def _should_stop(self) -> bool:
         """Check if monitoring should stop.
