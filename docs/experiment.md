@@ -79,3 +79,56 @@ j = Journal("experiments/my_experiment/runs/run_0001/journal.sqlite")
 for event in j.events(kind="cl_finished"):
     print(event["drift_event_id"], event["fwt"], event["bwt"])
 ```
+
+## Determinism and reruns
+
+`src.main` seeds torch, numpy, and the stdlib RNG from the top-level `seed`
+config at startup. Harnesses that additionally derive their per-window
+shuffle order from `apeiron.experiment.determinism.window_generator(seed,
+window, role)` (as the Well example does) make batch order a pure function
+of the config — independent of how much RNG state was consumed earlier in
+the run.
+
+Two runs of the same config on the same data then behave identically. To
+verify, compare journal signatures — a content hash of the run's behavior
+(event order, metrics, drift decisions) that excludes wall-clock
+timestamps and allocation-dependent fields like run names:
+
+```python
+from apeiron.experiment import Journal
+
+a = Journal("experiments/e/runs/run_0001/journal.sqlite").signature()
+b = Journal("experiments/e/runs/run_0002/journal.sqlite").signature()
+assert a == b
+```
+
+Each `window_started` event also records a `data_fingerprint` when the
+harness exposes one (file names + sizes for the Well example), so a rerun
+on silently-changed data fails the signature comparison rather than
+producing an unexplained divergence.
+
+## Continuing a run
+
+```bash
+poetry run python -m src.main --continue-from experiments/e/runs/run_0001
+```
+
+`--continue-from` (instead of `--config`) reuses the run's resolved config
+(`--set` overrides still apply on top — e.g. raise
+`drift_detection.max_stream_updates` to extend a completed run), appends to
+its journal, restores the stream/batch/drift-event counters from the
+journal tail, loads the newest checkpoint if one was saved, and resumes
+monitoring at the last started window.
+
+Limitations (by design, for now):
+
+- Resume granularity is the window: a run that stopped mid-window replays
+  that window from its start (the counters keep the detection cadence
+  continuous).
+- Checkpoints are only written after CL events when `model.max_ckpts > 0`;
+  without them, a continue restarts from the pretrained weights.
+- Detector state and the transfer-metric task registry are rebuilt fresh,
+  not restored: the detector re-warms, and BWT after a continue only spans
+  tasks registered since.
+- The metrics CSV is rewritten by the continuing process (it reflects the
+  latest segment); the journal is the durable, append-only record.

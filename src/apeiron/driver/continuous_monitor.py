@@ -113,9 +113,13 @@ class ContinuousMonitor:
         """
         self.logger.info("==== Starting Continuous Monitoring ====", level=0)
 
-        # Initialize first data stream
+        # Initialize the data stream. A continued run has a nonzero
+        # stream_update_count restored from its journal; the extra calls
+        # fast-forward the harness to the window where monitoring stopped
+        # (window sequences are deterministic, so this replays identically).
         self.logger.info("\tInitializing first data stream...", level=1)
-        self.modelHarness.update_data_stream()
+        for _ in range(self.stream_update_count + 1):
+            self.modelHarness.update_data_stream()
         self._journal_window()
 
         while not self._should_stop():
@@ -367,6 +371,9 @@ class ContinuousMonitor:
             "window_started",
             batch_count=self.batch_count,
             stream_update_count=self.stream_update_count,
+            data_fingerprint=getattr(
+                self.modelHarness, "current_window_fingerprint", None
+            ),
             data_time_start=timerange[0] if timerange else None,
             data_time_end=timerange[1] if timerange else None,
         )
