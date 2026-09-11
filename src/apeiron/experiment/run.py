@@ -130,6 +130,8 @@ class Run:
           backend, so an experiment run always records its metrics).
         - ``model.ckpts_path`` -> ``<run>/checkpoints`` (enable by setting
           ``model.max_ckpts > 0`` as before).
+        - ``experiment.run_name`` -> the allocated name, so downstream
+          consumers (e.g. residency pins) know which run they act for.
         """
         logging_cfg = cfg.logging or LoggingCfg(backend="wandb")
         logging_cfg = dataclasses.replace(
@@ -138,11 +140,28 @@ class Run:
         model_cfg = dataclasses.replace(
             cfg.model, ckpts_path=str(self.run_dir / "checkpoints")
         )
-        return dataclasses.replace(cfg, logging=logging_cfg, model=model_cfg)
+        assert cfg.experiment is not None
+        experiment_cfg = dataclasses.replace(cfg.experiment, run_name=self.run_dir.name)
+        return dataclasses.replace(
+            cfg, logging=logging_cfg, model=model_cfg, experiment=experiment_cfg
+        )
 
     # ----- lifecycle -----
 
     def finish(self, exit_code: int = 0) -> None:
-        """Record run_finished and close the journal."""
-        self.journal.record("run_finished", exit_code=exit_code)
+        """Record run_finished, release this run's artifact pins, close journal."""
+        released = self._release_pins()
+        self.journal.record("run_finished", exit_code=exit_code, pins_released=released)
         self.journal.close()
+
+    def _release_pins(self) -> int:
+        """Drop this run's pins in the experiment artifact store, if one exists."""
+        index = self.run_dir.parent.parent / "artifacts" / "index.sqlite"
+        if not index.exists():
+            return 0
+        from apeiron.experiment.artifacts import ArtifactStore
+
+        store = ArtifactStore(index.parent)
+        released = store.release_owner(self.run_dir.name)
+        store.close()
+        return released

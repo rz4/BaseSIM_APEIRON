@@ -80,6 +80,42 @@ for event in j.events(kind="cl_finished"):
     print(event["drift_event_id"], event["fwt"], event["bwt"])
 ```
 
+## Managed data residency (artifact store)
+
+Each experiment workspace can hold a shared, disk-tier cache of remote
+data, used by all its runs:
+
+```
+<experiment path>/
+    artifacts/
+        index.sqlite    # what is resident: identity, size, sha256, usage, pins
+        store/<...>     # the materialized files
+    runs/...
+```
+
+Harnesses that support it (the Well example does) materialize each stream
+window's files from the remote reservoir on demand, **pin** them for the
+duration of the run (pinned files are never evicted; pins are released
+when the run finishes), and **prefetch** the next window's files in the
+background while the current window is being processed.
+
+```toml
+[experiment]
+path = "experiments/my_experiment"
+artifact_budget_bytes = 20_000_000_000  # soft 20 GB cap; 0 = unlimited
+```
+
+When materializing would exceed the budget, least-recently-used unpinned
+artifacts are evicted first. The budget is soft: pinned artifacts are
+never evicted, so if a run's pins alone exceed it the store runs over
+with a warning rather than failing the run.
+
+For the Well example: with an `[experiment]` section and
+`data.path = "hf://datasets/polymathic-ai/"`, no manual download is
+needed — regime files land in the store on first use and later runs of
+the same experiment reuse them. Without an `[experiment]` section the
+hf:// path streams remotely and local paths are read directly, as before.
+
 ## Determinism and reruns
 
 `src.main` seeds torch, numpy, and the stdlib RNG from the top-level `seed`
