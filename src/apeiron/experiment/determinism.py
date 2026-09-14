@@ -55,3 +55,33 @@ def window_generator(seed: int, window: int, role: str = "") -> torch.Generator:
     g = torch.Generator()
     g.manual_seed(stable_seed(seed, window, role))
     return g
+
+
+class EpochSeededSampler(torch.utils.data.Sampler[int]):
+    """Shuffling sampler whose EVERY epoch is order-independent.
+
+    A shared ``torch.Generator`` makes epoch k's permutation depend on how
+    many epochs were drawn before it -- hidden state that a resumed run
+    cannot cheaply reproduce. Here each epoch's permutation is a pure
+    function of (seed, window, role, epoch index): resuming only needs the
+    integer ``epochs_started`` (captured in resilience snapshots via the
+    harness ``rng_state_dict`` hook), never generator state.
+    """
+
+    def __init__(self, n: int, seed: int, window: int, role: str):
+        self.n = n
+        self.seed = seed
+        self.window = window
+        self.role = role
+        self.epochs_started = 0
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(
+            stable_seed(self.seed, self.window, self.role, "epoch", self.epochs_started)
+        )
+        self.epochs_started += 1
+        return iter(torch.randperm(self.n, generator=g).tolist())

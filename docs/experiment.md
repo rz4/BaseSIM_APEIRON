@@ -238,15 +238,63 @@ its journal, restores the stream/batch/drift-event counters from the
 journal tail, loads the newest checkpoint if one was saved, and resumes
 monitoring at the last started window.
 
-Limitations (by design, for now):
+With resilience snapshots enabled (below), a continue is an **exact
+resume**: weights, optimizer state, RNG streams, detector internals, the
+transfer-metric registry, and the position inside the current window (or
+inside a CL loop) are all restored. Without snapshots, the older
+window-boundary behavior applies:
 
-- Resume granularity is the window: a run that stopped mid-window replays
-  that window from its start (the counters keep the detection cadence
-  continuous).
-- Checkpoints are only written after CL events when `model.max_ckpts > 0`;
-  without them, a continue restarts from the pretrained weights.
-- Detector state and the transfer-metric task registry are rebuilt fresh,
-  not restored: the detector re-warms, and BWT after a continue only spans
-  tasks registered since.
-- The metrics CSV is rewritten by the continuing process (it reflects the
-  latest segment); the journal is the durable, append-only record.
+- The window that was in progress replays from its start (counters keep
+  the detection cadence continuous).
+- The model restarts from the newest analysis checkpoint, or — with a
+  loud warning — from the pretrained weights if none was saved.
+- Detector state and the task registry are rebuilt fresh.
+- Either way, the metrics CSV is rewritten by the continuing process (it
+  reflects the latest segment); the journal is the durable record.
+
+## Resilience snapshots
+
+For runs that can be killed mid-flight (job walltime limits, preemption),
+enable periodic full-state snapshots:
+
+```toml
+[experiment]
+path = "experiments/my_experiment"
+snapshot_interval = 200  # snapshot every N updates; 0 = disabled
+```
+
+An *update* is one stream batch while monitoring or one inner iteration
+during a CL loop. Snapshots are written atomically under
+`<run>/checkpoints/resilience/` (the post-CL analysis checkpoints live
+beside them under `analysis/`), keeping the last two; `--continue-from`
+prefers the newest snapshot automatically.
+
+A snapshot contains everything that cannot be recomputed: model and
+optimizer state, all RNG states, the monitor's counters and partial
+metric buffer, the phase (monitoring or CL, with the inner iteration),
+pickled detector internals, updater memory (EWC/KFAC), and task-registry
+references. Data, shuffle orders, and loader positions are re-derived
+from the config (determinism) and fast-forwarded by counting.
+
+The guarantee is **crash-equivalence**: a run killed at an arbitrary
+update and resumed from its snapshot produces a journal signature-equal
+to an uninterrupted run of the same config. Snapshot bookkeeping events
+(`snapshot_saved`, `run_interrupted`, `run_continued`) are excluded from
+signatures, like residency accounting.
+
+### Walltime signals
+
+`src.main` installs handlers for `SIGUSR1` and `SIGTERM`: on receipt, the
+run saves a snapshot at the next update boundary, journals
+`run_interrupted`, and exits cleanly with status 0. On Slurm, request the
+warning signal ahead of the kill:
+
+```bash
+#SBATCH --signal=USR1@300   # SIGUSR1 five minutes before the time limit
+```
+
+Test locally with `kill -USR1 <pid>`. Harnesses whose eval sets should
+survive a resume with constant memory should override
+`build_window_eval_loader(window)` (the Well example does): the
+transfer-metric registry then stores window references instead of frozen
+in-memory copies.

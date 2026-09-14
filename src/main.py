@@ -1,3 +1,4 @@
+import signal
 import sys
 
 import torch
@@ -80,19 +81,50 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if resume is not None and run is not None:
-        monitor.stream_update_count = resume["stream_update_count"]
-        monitor.batch_count = resume["batch_count"]
-        monitor.drift_event_count = resume["drift_event_count"]
-        ckpt = run.latest_checkpoint
-        if ckpt is not None:
-            # Default checkpoint payload is model.state_dict(); harnesses that
-            # override build_checkpoint_payload() must load their own format.
-            state = torch.load(ckpt, map_location=cfg.device, weights_only=False)
-            modelHarness.model.load_state_dict(state)
-            logger.info(f"Continuing from checkpoint: {ckpt}", level=0)
+        snapshot = run.latest_snapshot(map_location=cfg.device)
+        if snapshot is not None:
+            # Full-state resilience snapshot: exact resume (weights, optimizer,
+            # RNG, detector, counters, mid-window/mid-CL position).
+            monitor.restore_snapshot(snapshot)
+        else:
+            # No snapshot: window-boundary resume from journal counters plus
+            # the newest analysis checkpoint, if any.
+            monitor.stream_update_count = resume["stream_update_count"]
+            monitor.batch_count = resume["batch_count"]
+            monitor.drift_event_count = resume["drift_event_count"]
+            ckpt = run.latest_checkpoint
+            if ckpt is not None:
+                # Default checkpoint payload is model.state_dict(); harnesses
+                # overriding build_checkpoint_payload() load their own format.
+                state = torch.load(ckpt, map_location=cfg.device, weights_only=False)
+                modelHarness.model.load_state_dict(state)
+                logger.info(f"Continuing from checkpoint: {ckpt}", level=0)
+            else:
+                logger.warning(
+                    "Continuing WITHOUT any checkpoint: no resilience snapshot "
+                    "and no analysis checkpoint found -- the model restarts "
+                    "from its pretrained weights, which is NOT a faithful "
+                    "continuation. Enable [experiment] snapshot_interval or "
+                    "model.max_ckpts to avoid this."
+                )
+
+    # Walltime resilience: Slurm-style pre-kill warnings (--signal=USR1@300)
+    # and polite terminations request a snapshot + clean exit at the next
+    # update boundary. Test locally with: kill -USR1 <pid>
+    def _request_interrupt(signum, frame):  # noqa: ARG001
+        monitor.interrupt_requested = True
+
+    signal.signal(signal.SIGUSR1, _request_interrupt)
+    signal.signal(signal.SIGTERM, _request_interrupt)
 
     # Run continuous monitoring
-    monitor.run()
+    try:
+        monitor.run()
+    except SystemExit:
+        # Interrupt path: snapshot + run_interrupted already recorded; flush
+        # the metrics CSV and exit without run_finished (the run is not done).
+        logger.finish()
+        raise
 
     # TODO: Save a model checkpoint
 

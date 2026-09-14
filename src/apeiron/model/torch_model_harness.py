@@ -42,9 +42,11 @@ class BaseModelHarness(ABC):
         # declares its windows (see describe_window); None otherwise.
         self.data_resolver: Optional["DataResolver"] = None
 
-        # One entry per drift event, oldest first: the frozen validation split of
-        # the window that was adapted to, paired with R[i][i] (see register_task).
-        self._task_records: List[Tuple[DataLoader, List[float]]] = []
+        # One entry per drift event, oldest first, paired with R[i][i] (see
+        # register_task). The first element is either a frozen in-memory
+        # DataLoader (legacy) or an int window index (declarative -- rebuilt
+        # on demand via build_window_eval_loader).
+        self._task_records: List[Tuple[Any, List[float]]] = []
         self.max_task_records: int = 50
 
     @abstractmethod
@@ -112,6 +114,29 @@ class BaseModelHarness(ABC):
         data inside ``update_data_stream()``.
         """
         return None
+
+    # ----- resilience: harness-owned RNG state (loader shuffle epochs) -----
+
+    def rng_state_dict(self) -> Dict[str, int]:
+        """Epoch counters of the harness's stateful shuffling samplers.
+
+        Shuffling loaders that persist across CL events within a window
+        carry hidden state (how many epoch permutations they have drawn).
+        Harnesses using :class:`~apeiron.experiment.determinism.EpochSeededSampler`
+        report ``{role: epochs_started}`` here so resilience snapshots can
+        restore exact shuffle positions. Default: no stateful samplers.
+        """
+        return {}
+
+    def load_rng_state_dict(self, state: Dict[str, int], in_cl: bool) -> None:
+        """Restore sampler epoch counters captured by :meth:`rng_state_dict`.
+
+        :param in_cl: True when the snapshot was taken inside a CL loop --
+            the training sampler's current epoch was then in progress and
+            must be re-drawn (counter - 1); at a monitoring snapshot the
+            training loader sits at an epoch boundary (counter unchanged).
+        """
+        pass
 
     # ----- batch handling (override for non-tuple batches) -----
 
@@ -209,37 +234,57 @@ class BaseModelHarness(ABC):
 
     # ----- per-task evaluation (train-test matrix R) -----
 
-    def register_task(self, diagonal_metrics: List[float]) -> None:
+    def build_window_eval_loader(self, window: int) -> Optional[DataLoader]:
+        """Rebuild the eval set of a PAST stream window, or None (default).
+
+        Overriding this opts the transfer-metric registry into declarative
+        mode: :meth:`register_task` stores only the window index (and the
+        deterministic window definition rebuilds the data on demand)
+        instead of freezing the split into memory. This keeps registry
+        memory constant and makes the registry snapshot-able for resume.
+        """
+        return None
+
+    @property
+    def _declarative_tasks(self) -> bool:
+        return (
+            type(self).build_window_eval_loader
+            is not BaseModelHarness.build_window_eval_loader
+        )
+
+    def register_task(self, diagonal_metrics: List[float], window: int = -1) -> None:
         """Record the task just finished so later events can measure forgetting.
 
         A *task* is one drift event: the window the detector fired on and the CL
-        loop adapted to. This freezes that window's validation split into a
-        standalone eval set and stores it alongside ``diagonal_metrics`` --
-        ``R[i][i]``, the score on the window measured right after adapting to it.
-        Both travel in the same record so eviction can never misalign a task's
+        loop adapted to. Its eval set is stored either as a window REFERENCE
+        (harnesses overriding :meth:`build_window_eval_loader`; rebuilt on
+        demand from the deterministic window definition) or, legacy, by
+        freezing the validation split into memory. Either travels with
+        ``diagonal_metrics`` -- ``R[i][i]``, the score on the window measured
+        right after adapting to it -- so eviction can never misalign a task's
         eval set from its diagonal.
 
-        The split is copied into memory rather than referenced: the harness drops
-        its window tensors as the stream advances, and a plain ``DataLoader``
-        reference would keep the whole window alive through a view.
-
-        :param diagonal_metrics: ``eval()`` output for the current window, taken
-            after the CL loop finished.
-        :type diagonal_metrics: List[float]
+        :param diagonal_metrics: ``eval()`` output for the current window,
+            taken after the CL loop finished.
+        :param window: the window index being registered (declarative mode);
+            ignored in legacy mode.
         """
-        xs: List[Tensor] = []
-        ys: List[Tensor] = []
-        for batch in self.get_train_dataloaders()[1]:
-            x, y = self._unpack(batch)
-            xs.append(x.detach().cpu().clone())
-            ys.append(y.detach().cpu().clone())
+        if self._declarative_tasks:
+            self._task_records.append((window, list(diagonal_metrics)))
+        else:
+            xs: List[Tensor] = []
+            ys: List[Tensor] = []
+            for batch in self.get_train_dataloaders()[1]:
+                x, y = self._unpack(batch)
+                xs.append(x.detach().cpu().clone())
+                ys.append(y.detach().cpu().clone())
 
-        frozen = DataLoader(
-            TensorDataset(torch.cat(xs), torch.cat(ys)),
-            batch_size=self.cfg.train.batch_size,
-            shuffle=False,
-        )
-        self._task_records.append((frozen, list(diagonal_metrics)))
+            frozen = DataLoader(
+                TensorDataset(torch.cat(xs), torch.cat(ys)),
+                batch_size=self.cfg.train.batch_size,
+                shuffle=False,
+            )
+            self._task_records.append((frozen, list(diagonal_metrics)))
 
         # Cap retained tasks; BWT then averages over the surviving ones.
         while len(self._task_records) > self.max_task_records:
@@ -247,13 +292,31 @@ class BaseModelHarness(ABC):
 
     @torch.no_grad()
     def eval_past_tasks(self) -> List[List[float]]:
-        """Score the current model on every registered task's frozen eval set.
+        """Score the current model on every registered task's eval set.
 
         Returns row ``T`` of the train-test matrix below the diagonal --
         ``[R[T][i] for i < T]``, oldest task first, index-aligned with
         :attr:`task_diagonals`. Empty until at least one task is registered.
         """
-        return [self._eval_loader(loader) for loader, _ in self._task_records]
+        results = []
+        for ref, _ in self._task_records:
+            loader = ref if isinstance(ref, DataLoader) else None
+            if loader is None:
+                loader = self.build_window_eval_loader(int(ref))
+            assert loader is not None, f"cannot rebuild eval loader for task {ref}"
+            results.append(self._eval_loader(loader))
+        return results
+
+    # ----- resilience: registry capture/restore (declarative mode only) -----
+
+    def task_records_refs(self) -> Optional[List[Tuple[int, List[float]]]]:
+        """Registry as (window, diagonal) references, or None in legacy mode."""
+        if not self._declarative_tasks:
+            return None
+        return [(int(ref), list(diag)) for ref, diag in self._task_records]
+
+    def restore_task_records(self, refs: List[Tuple[int, List[float]]]) -> None:
+        self._task_records = [(int(w), list(d)) for w, d in refs]
 
     @property
     def task_diagonals(self) -> List[List[float]]:
@@ -281,8 +344,13 @@ class BaseModelHarness(ABC):
         return self.model.state_dict()
 
     def save_ckpt(self, event: int) -> str:
-        """Persist model state, evict oldest when over budget."""
-        d = Path(self.cfg.model.ckpts_path)
+        """Persist model state, evict oldest when over budget.
+
+        Analysis checkpoints live under ``<ckpts_path>/analysis/``;
+        resilience snapshots (full-state, for restart) live beside them
+        under ``resilience/`` and are managed by the monitor.
+        """
+        d = Path(self.cfg.model.ckpts_path) / "analysis"
         d.mkdir(parents=True, exist_ok=True)
 
         fname = f"drift_adaptation_{event}.pt"

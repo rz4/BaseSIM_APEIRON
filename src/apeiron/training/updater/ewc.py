@@ -135,3 +135,20 @@ class OnlineEWCUpdater(BaseUpdater):
 
         self._cl_steps += 1
         self._batch_fisher = None
+
+    def state_dict(self) -> dict:
+        return {
+            "theta_star": self.theta_star,
+            "fisher": self.fisher,
+            "cl_fisher_accum": self._cl_fisher_accum,
+            "cl_steps": self._cl_steps,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.theta_star = {k: v.to(self.device) for k, v in state["theta_star"].items()}
+        self.fisher = {k: v.to(self.device) for k, v in state["fisher"].items()}
+        accum = state.get("cl_fisher_accum")
+        self._cl_fisher_accum = (
+            {k: v.to(self.device) for k, v in accum.items()} if accum else None
+        )
+        self._cl_steps = int(state.get("cl_steps", 0))

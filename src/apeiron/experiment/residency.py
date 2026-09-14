@@ -47,6 +47,15 @@ class EnsureStats:
 class ResidencyManager:
     """Materialize / evict / pin / prefetch over one artifact store."""
 
+    #: How long ensure() tolerates an in-flight fetch of the same object
+    #: making NO byte progress before fetching it itself. A healthy slow
+    #: download is waited on indefinitely (its temp files keep growing); a
+    #: fetch hung on a dead connection (laptop sleep, network drop) stalls,
+    #: gets abandoned after this window, and can never deadlock the main
+    #: loop -- at worst the object downloads twice.
+    INFLIGHT_STALL_S = 60.0
+    _INFLIGHT_POLL_S = 5.0
+
     def __init__(self, store: ArtifactStore, budget_bytes: int = 0):
         """
         :param store: the experiment's artifact store.
@@ -54,7 +63,8 @@ class ResidencyManager:
         """
         self.store = store
         self.budget_bytes = budget_bytes
-        self._fetch_lock = threading.Lock()
+        self._inflight: dict[str, threading.Event] = {}
+        self._inflight_lock = threading.Lock()
 
     # ----- the core verb -----
 
@@ -84,8 +94,29 @@ class ResidencyManager:
                     f" ({(obj.size or 0) / 1e6:.0f} MB)",
                     level=1,
                 )
-                with self._fetch_lock:  # one network fetch at a time
-                    if self.store.is_materialized(obj.uri):  # prefetch race
+                # If another thread is already fetching this object, wait a
+                # bounded time for it; on timeout (hung fetch) fall through
+                # and fetch it ourselves (sources use unique temp names, so
+                # concurrent fetches of one object are safe, just wasteful).
+                mine: Optional[threading.Event] = None
+                with self._inflight_lock:
+                    theirs = self._inflight.get(obj.uri)
+                    if theirs is None:
+                        mine = self._inflight[obj.uri] = threading.Event()
+                if theirs is not None:
+                    self._await_inflight(theirs, dest)
+                    if self.store.is_materialized(obj.uri):
+                        self.store.touch(obj.uri)
+                        stats.hit_count += 1
+                        stats.hit_bytes += obj.size or 0
+                        if owner is not None:
+                            self.store.pin(obj.uri, owner)
+                        continue
+                    with self._inflight_lock:
+                        if obj.uri not in self._inflight:
+                            mine = self._inflight[obj.uri] = threading.Event()
+                try:
+                    if self.store.is_materialized(obj.uri):  # lost a race
                         stats.hit_count += 1
                         stats.hit_bytes += obj.size or 0
                     else:
@@ -102,10 +133,44 @@ class ResidencyManager:
                         )
                         stats.fetched_count += 1
                         stats.fetched_bytes += actual
+                finally:
+                    if mine is not None:
+                        with self._inflight_lock:
+                            self._inflight.pop(obj.uri, None)
+                        mine.set()
             if owner is not None:
                 self.store.pin(obj.uri, owner)
         stats.seconds = time.perf_counter() - t0
         return stats
+
+    def _await_inflight(self, done: threading.Event, dest: Path) -> None:
+        """Wait for another thread's fetch while it makes byte progress."""
+        last, stalled = -1, 0.0
+        while not done.wait(timeout=self._INFLIGHT_POLL_S):
+            progress = self._inflight_bytes(dest)
+            if progress > last:
+                last, stalled = progress, 0.0
+            else:
+                stalled += self._INFLIGHT_POLL_S
+                if stalled >= self.INFLIGHT_STALL_S:
+                    get_logger().warning(
+                        f"[residency] in-flight fetch of {dest.name} stalled "
+                        f"{stalled:.0f}s; fetching it in this thread instead"
+                    )
+                    return
+
+    @staticmethod
+    def _inflight_bytes(dest: Path) -> int:
+        """Bytes so far of any in-flight temp files for ``dest``."""
+        total = dest.stat().st_size if dest.exists() else 0
+        for tmp in dest.parent.glob(f".fetch-*{dest.name}"):
+            for f in tmp.rglob("*") if tmp.is_dir() else [tmp]:
+                try:
+                    if f.is_file():
+                        total += f.stat().st_size
+                except OSError:
+                    pass
+        return total
 
     # ----- eviction -----
 

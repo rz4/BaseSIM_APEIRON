@@ -175,6 +175,29 @@ class OnlineKFACUpdater(BaseUpdater):
     def update_post_optimizer_call(self):
         self._cl_steps += 1
 
+    def state_dict(self) -> dict:
+        return {
+            "theta_star": self.theta_star,
+            "A": self.A,
+            "G": self.G,
+            "A_accum": self._A_accum,
+            "G_accum": self._G_accum,
+            "cl_steps": self._cl_steps,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        def _to_dev(d):
+            return (
+                {k: v.to(self.device) for k, v in d.items()} if d is not None else None
+            )
+
+        self.theta_star = _to_dev(state["theta_star"])
+        self.A = _to_dev(state["A"])
+        self.G = _to_dev(state["G"])
+        self._A_accum = _to_dev(state.get("A_accum"))
+        self._G_accum = _to_dev(state.get("G_accum"))
+        self._cl_steps = int(state.get("cl_steps", 0))
+
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------

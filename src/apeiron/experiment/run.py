@@ -106,11 +106,21 @@ class Run:
 
     @property
     def latest_checkpoint(self) -> Optional[Path]:
-        """Path of the newest checkpoint, or None if none was saved."""
-        pointer = self.run_dir / "checkpoints" / "latest"
+        """Path of the newest analysis checkpoint, or None if none was saved."""
+        analysis = self.run_dir / "checkpoints" / "analysis"
+        pointer = analysis / "latest"
         if not pointer.exists():
             return None
-        return self.run_dir / "checkpoints" / pointer.read_text().strip()
+        return analysis / pointer.read_text().strip()
+
+    def latest_snapshot(self, map_location: str = "cpu") -> Optional[dict]:
+        """The newest resilience snapshot's full state, or None."""
+        from apeiron.experiment.snapshot import SnapshotManager
+
+        resilience = self.run_dir / "checkpoints" / "resilience"
+        if not resilience.is_dir():
+            return None
+        return SnapshotManager(resilience).load_latest(map_location=map_location)
 
     @staticmethod
     def _next_run_name(runs_root: Path) -> str:

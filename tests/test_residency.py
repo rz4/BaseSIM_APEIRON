@@ -195,3 +195,51 @@ class TestRunPinRelease:
         assert bound.experiment is not None
         assert bound.experiment.run_name == run.run_dir.name
         run.finish()
+
+
+class TestInflightRobustness:
+    """A hung fetch (dead socket after sleep) must never block ensure()."""
+
+    def test_hung_inflight_fetch_does_not_block_ensure(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
+        from apeiron.experiment.sources import LocalSource as RealLocal
+
+        objs = _local_objects(tmp_path, {"a.bin": 32})
+        rm = ResidencyManager(ArtifactStore(tmp_path / "artifacts"))
+        monkeypatch.setattr(ResidencyManager, "INFLIGHT_STALL_S", 0.2)
+        monkeypatch.setattr(ResidencyManager, "_INFLIGHT_POLL_S", 0.05)
+
+        hang_forever = threading.Event()
+
+        class HangingSource:
+            def fetch(self, obj, dest):
+                hang_forever.wait()  # dead-socket stand-in: never returns
+
+        sources = iter([HangingSource(), RealLocal()])
+        with patch(
+            "apeiron.experiment.residency.get_source",
+            side_effect=lambda uri: next(sources),
+        ):
+            rm.prefetch(list(objs))  # grabs the in-flight slot, hangs
+            time.sleep(0.1)
+            stats = rm.ensure(objs, owner="run_1")  # stalls out, self-fetches
+
+        assert rm.store.is_materialized(objs[0].uri)
+        assert stats.fetched_count == 1
+        hang_forever.set()
+        rm.store.close()
+
+    def test_healthy_inflight_fetch_is_waited_on(self, tmp_path, monkeypatch):
+        objs = _local_objects(tmp_path, {"a.bin": 40})
+        rm = ResidencyManager(ArtifactStore(tmp_path / "artifacts"))
+        monkeypatch.setattr(ResidencyManager, "_INFLIGHT_POLL_S", 0.05)
+
+        t = rm.prefetch(list(objs))
+        t.join(timeout=10)
+        with patch("apeiron.experiment.residency.get_source") as mock_src:
+            stats = rm.ensure(objs, owner="run_1")  # already done: pure hit
+        mock_src.assert_not_called()
+        assert stats.hit_count == 1
+        rm.store.close()
