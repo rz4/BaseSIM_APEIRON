@@ -91,9 +91,14 @@ def _select_best_gpu() -> int | None:
 class ModelCfg:
     name: str
     pretrained_path: str = ""
-    # FIFO checkpointing: 0 disables, N keeps last N post-CL snapshots
+    # Checkpointing: 0 disables, N caps retained post-CL snapshots
     max_ckpts: int = 0
     ckpts_path: str = ""
+    # Which snapshots survive the cap: "latest" (newest N, the legacy FIFO),
+    # "best_current", or "best_hist" (scored from the run journal's
+    # cl_finished metrics; the newest snapshot always survives so
+    # --continue-from matches the stream position). See docs/experiment.md.
+    ckpt_retention: str = "latest"
 
 
 @dataclass(frozen=True)

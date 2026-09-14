@@ -290,9 +290,15 @@ class BaseModelHarness(ABC):
         torch.save(payload, d / fname)
         (d / "latest").write_text(fname)
 
-        # Guillotine the oldest survivors
-        alive = sorted(d.glob("drift_adaptation_*.pt"), key=lambda p: p.stat().st_mtime)
-        while len(alive) > self.cfg.model.max_ckpts:
-            alive.pop(0).unlink()
+        # Guillotine the oldest survivors. Metric-based retention policies
+        # ("best_current"/"best_hist") are applied by the monitor via
+        # apeiron.experiment.retention instead -- inline FIFO here would
+        # delete candidates before they can be scored.
+        if self.cfg.model.ckpt_retention == "latest":
+            alive = sorted(
+                d.glob("drift_adaptation_*.pt"), key=lambda p: p.stat().st_mtime
+            )
+            while len(alive) > self.cfg.model.max_ckpts:
+                alive.pop(0).unlink()
 
         return str(d / fname)

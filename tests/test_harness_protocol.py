@@ -146,10 +146,6 @@ class TestDataResolver:
 # ---------------------------------------------------------------------------
 # monitor drives the protocol
 # ---------------------------------------------------------------------------
-class _DeclaringHarness:
-    """Wrap DummyHarness with declared windows via composition-by-patching."""
-
-
 class TestMonitorAdvance:
     def _specs(self, tmp_path, n=3):
         return [_spec_from_local(tmp_path, name=f"w{i}") for i in range(n)]
