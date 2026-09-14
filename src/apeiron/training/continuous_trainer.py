@@ -45,8 +45,12 @@ class ContinuousTrainer:
         current_iter: Iterator,
         loader: DataLoader,
         min_batch: Optional[int] = None,
-    ) -> tuple[Iterator, list[torch.Tensor]]:
-        """Get next batch from iterator, restarting on exhaustion and enforcing min batch size."""
+    ) -> tuple[Iterator, Any]:
+        """Get next batch from iterator, restarting on exhaustion and enforcing min batch size.
+
+        Batch structure (tuple vs dict) and device transfer are delegated to
+        the harness's ``batch_to_device``/``batch_size_of`` hooks.
+        """
         while True:
             try:
                 batch = next(current_iter)
@@ -55,16 +59,16 @@ class ContinuousTrainer:
                 batch = next(current_iter)
 
             if min_batch is None:
-                return current_iter, [b.to(self.cfg.device) for b in batch]
+                return current_iter, self.modelHarness.batch_to_device(
+                    batch, self.cfg.device
+                )
 
-            # Try to enforce batch-size on the second element (x, y)
-            try:
-                y = batch[1]
-                if getattr(y, "shape", None) is not None and y.shape[0] >= min_batch:
-                    return current_iter, [b.to(self.cfg.device) for b in batch]
-            except (IndexError, TypeError):
-                # If we cannot inspect batch size, just accept the batch
-                return current_iter, [b.to(self.cfg.device) for b in batch]
+            size = self.modelHarness.batch_size_of(batch)
+            # Uninspectable batches are accepted as-is (legacy behavior)
+            if size is None or size >= min_batch:
+                return current_iter, self.modelHarness.batch_to_device(
+                    batch, self.cfg.device
+                )
 
     def _log_validation(
         self,

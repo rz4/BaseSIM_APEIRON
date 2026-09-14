@@ -108,12 +108,16 @@ class TestResidencyManager:
     def test_materialize_and_idempotence(self, tmp_path):
         objs = _local_objects(tmp_path, {"a.bin": 100})
         rm = ResidencyManager(ArtifactStore(tmp_path / "artifacts"))
-        root = rm.ensure(objs, owner="run_1")
-        local = root / objs[0].relpath
+        stats = rm.ensure(objs, owner="run_1")
+        local = rm.store.store_root / objs[0].relpath
         assert local.exists() and local.stat().st_size == 100
+        assert stats.fetched_count == 1 and stats.fetched_bytes == 100
+        assert stats.hit_count == 0
         with patch("apeiron.experiment.residency.get_source") as mock_src:
-            rm.ensure(objs, owner="run_1")  # second call: no fetch
+            stats2 = rm.ensure(objs, owner="run_1")  # second call: no fetch
         mock_src.assert_not_called()
+        assert stats2.hit_count == 1 and stats2.hit_bytes == 100
+        assert stats2.fetched_count == 0
         rm.store.close()
 
     def test_size_mismatch_rejected(self, tmp_path):

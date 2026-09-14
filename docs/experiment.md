@@ -116,6 +116,43 @@ needed — regime files land in the store on first use and later runs of
 the same experiment reuse them. Without an `[experiment]` section the
 hf:// path streams remotely and local paths are read directly, as before.
 
+### Declaring windows from a harness
+
+A harness opts into managed residency by declaring each stream window's
+data needs instead of fetching data itself:
+
+```python
+from apeiron.experiment.sources import WindowSpec
+
+class MyHarness(BaseModelHarness):
+    def describe_window(self, window: int) -> WindowSpec | None:
+        if window >= self.n_windows:
+            return None  # past the end; also stops prefetch
+        return WindowSpec(
+            objects=tuple(self._window_objects(window)),  # RemoteObjects
+            fingerprint=self._window_fingerprint(window),
+            label=self._window_name(window),
+        )
+```
+
+Before each `update_data_stream()`, the monitor materializes the declared
+objects (pinned for the run) and afterwards prefetches the next window's
+objects in the background. The framework injects `self.data_resolver`;
+the harness reads the materialized files under
+`self.data_resolver.store_root` and never touches stores, pins, budgets,
+or threads. Harnesses that return `None` (the default) keep fetching
+their own data — nothing changes for them.
+
+Each materialization is journaled as a `window_materialized` event with
+transfer accounting (`fetched_bytes`, `hit_bytes`, `evicted_bytes`,
+`seconds`). These events record cache state, not behavior, so they are
+excluded from journal signatures (a cold and a warm rerun still compare
+equal).
+
+Harnesses whose loaders yield dict batches (rather than `(x, y)` tuples)
+should also override `batch_to_device` / `batch_size_of` if the defaults
+don't fit; the trainer routes all batch handling through these hooks.
+
 ## Determinism and reruns
 
 `src.main` seeds torch, numpy, and the stdlib RNG from the top-level `seed`

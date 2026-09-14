@@ -35,6 +35,21 @@ class RemoteObject:
     sha256: Optional[str] = None  # reservoir-declared content hash, if any
 
 
+@dataclass(frozen=True)
+class WindowSpec:
+    """A harness's declaration of one stream window's data needs.
+
+    Returned by ``BaseModelHarness.describe_window(window)``; the framework
+    materializes ``objects`` into the experiment's artifact store (pinned
+    for the run, next window prefetched) before the harness builds its
+    loaders, and records ``fingerprint``/``label`` in the journal.
+    """
+
+    objects: tuple[RemoteObject, ...]
+    fingerprint: str  # content identity of the window's data
+    label: str = ""  # human-readable window name (e.g. the regime)
+
+
 class Source(ABC):
     """Adapter for one reservoir kind."""
 

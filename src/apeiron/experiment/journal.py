@@ -80,18 +80,25 @@ class Journal:
     # Payload keys that legitimately differ between reruns of the same
     # experiment (allocation-dependent, not behavior-dependent).
     VOLATILE_KEYS = frozenset({"run_name", "original_config", "path"})
+    # Event kinds that record cache/transfer state rather than behavior:
+    # a cold and a warm rerun legitimately differ here (residency is cache
+    # state, not run state).
+    VOLATILE_KINDS = frozenset({"window_materialized"})
 
     def signature(self) -> str:
         """Content hash of the run's behavior, for rerun comparison.
 
         Two runs of the same config on the same data should produce equal
         signatures (the determinism contract). Wall-clock timestamps, row
-        ids, and allocation-dependent payload keys (run/checkpoint paths)
-        are excluded; everything else -- event order, kinds, batch counts,
-        metrics, drift decisions -- is included.
+        ids, allocation-dependent payload keys (run/checkpoint paths), and
+        cache-state event kinds (residency accounting) are excluded;
+        everything else -- event order, kinds, batch counts, metrics, drift
+        decisions -- is included.
         """
         h = hashlib.sha256()
         for e in self.events():
+            if e["kind"] in self.VOLATILE_KINDS:
+                continue
             payload = {
                 k: e[k]
                 for k in sorted(e)
