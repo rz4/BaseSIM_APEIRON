@@ -1,7 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional, Callable, Tuple, List, Dict
+from typing import TYPE_CHECKING, Any, Optional, Callable, Tuple, List, Dict
 
 import torch
 from torch import nn, Tensor
@@ -9,6 +9,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import Optimizer
 
 from apeiron.config.configuration import Config
+
+if TYPE_CHECKING:
+    from apeiron.experiment.residency import DataResolver
+    from apeiron.experiment.sources import WindowSpec
 
 MetricFn = Callable[[Tensor, Tensor], Any]
 CriterionFn = Callable[[Tensor, Tensor], Tensor]
@@ -33,6 +37,10 @@ class BaseModelHarness(ABC):
         self.model.to(device)
 
         self.eval_metrics: Dict[str, MetricFn] = {}
+
+        # Injected by the framework in experiment mode when the harness
+        # declares its windows (see describe_window); None otherwise.
+        self.data_resolver: Optional["DataResolver"] = None
 
         # One entry per drift event, oldest first: the frozen validation split of
         # the window that was adapted to, paired with R[i][i] (see register_task).
@@ -86,6 +94,43 @@ class BaseModelHarness(ABC):
     def get_criterion(self) -> CriterionFn:
         """Return a loss function compatible with model output and dataloader labels"""
         raise NotImplementedError
+
+    # ----- declarative data protocol (optional) -----
+
+    def describe_window(self, window: int) -> Optional["WindowSpec"]:
+        """Declare stream window ``window``'s data needs, or None.
+
+        Returning a :class:`~apeiron.experiment.sources.WindowSpec` opts
+        into framework-managed residency: before ``update_data_stream()``
+        for that window, the monitor materializes the spec's objects into
+        the experiment artifact store (pinned for the run) and prefetches
+        the next window's spec; the harness reads the local files under
+        ``self.data_resolver.store_root``. A window index past the end of
+        the stream should return None (stops prefetch).
+
+        Default None = imperative legacy mode: the harness fetches its own
+        data inside ``update_data_stream()``.
+        """
+        return None
+
+    # ----- batch handling (override for non-tuple batches) -----
+
+    def batch_to_device(self, batch: Any, device: Any) -> Any:
+        """Move a loader batch to a device, preserving its structure."""
+        if isinstance(batch, dict):
+            return {
+                k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()
+            }
+        return [t.to(device) if hasattr(t, "to") else t for t in batch]
+
+    def batch_size_of(self, batch: Any) -> Optional[int]:
+        """Sample count of a loader batch, or None if not inspectable."""
+        try:
+            probe = next(iter(batch.values())) if isinstance(batch, dict) else batch[1]
+        except (IndexError, TypeError, KeyError, StopIteration):
+            return None
+        shape = getattr(probe, "shape", None)
+        return int(shape[0]) if shape is not None and len(shape) > 0 else None
 
     # ----- helpers -----
     def _unpack(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:

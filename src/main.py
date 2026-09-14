@@ -13,6 +13,7 @@ from apeiron.config.configuration import (
 )
 from apeiron.experiment import Run
 from apeiron.experiment.determinism import seed_everything
+from apeiron.experiment.residency import DataResolver
 
 from examples.utils import get_example
 
@@ -57,6 +58,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     modelHarness = get_example(cfg=cfg)
+
+    # Experiment mode: hand the harness the framework-owned data resolver.
+    # Harnesses that declare their windows (describe_window) get managed
+    # residency -- materialization, pinning, prefetch -- for free.
+    if run is not None:
+        modelHarness.data_resolver = DataResolver.for_run(cfg, run)
 
     # Determine project/experiment name
     project_name = "basesim-framework"

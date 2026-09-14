@@ -19,7 +19,6 @@ so the rest of apeiron (monitor, trainer, updaters) sees ordinary tuples.
 """
 
 import hashlib
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -29,13 +28,9 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset
 
 from apeiron.config.configuration import Config
-from apeiron.experiment import (
-    ArtifactStore,
-    RemoteObject,
-    ResidencyManager,
-    get_source,
-)
+from apeiron.experiment import RemoteObject, get_source
 from apeiron.experiment.determinism import window_generator
+from apeiron.experiment.sources import WindowSpec
 from apeiron.model.torch_model_harness import BaseModelHarness
 
 # The pretrained Well FNO baselines consume 4 input steps and predict 1 step
@@ -101,23 +96,19 @@ class WELL_FNO(BaseModelHarness):
         self.dataset_name = cfg.data.name.split(":", 1)[1]
         self.base_path = cfg.data.path
 
-        # Managed residency: with an [experiment] section and an hf:// data
-        # path, regime files are materialized on demand into the experiment's
-        # artifact store (pinned for this run, next window prefetched) and
-        # WellDataset reads local files. Without it: hf:// streams remotely,
-        # local paths read directly -- the pre-M4 behaviors, unchanged.
+        # Managed residency (declarative): with an [experiment] section and
+        # an hf:// data path, this harness DECLARES each window's needs via
+        # describe_window(); the framework materializes them into the
+        # experiment's artifact store (pinned, next window prefetched) and
+        # injects self.data_resolver, whose store_root the loaders read
+        # from. Without it: hf:// streams remotely, local paths read
+        # directly -- the legacy behaviors, unchanged.
         self.managed = cfg.experiment is not None and self.base_path.startswith("hf://")
         if self.managed:
-            assert cfg.experiment is not None
-            store = ArtifactStore(Path(cfg.experiment.path) / "artifacts")
-            self._residency: Optional[ResidencyManager] = ResidencyManager(
-                store, budget_bytes=cfg.experiment.artifact_budget_bytes
-            )
-            self._pin_owner = cfg.experiment.run_name or "unnamed-run"
             dataset_uri = f"{self.base_path.rstrip('/')}/{self.dataset_name}"
             self._objects = get_source(dataset_uri).list(dataset_uri)
-            org = self.base_path.rstrip("/").rsplit("/", 1)[-1]
-            self._effective_base = str(store.store_root / "datasets" / org)
+            self._org = self.base_path.rstrip("/").rsplit("/", 1)[-1]
+            self._effective_base = ""  # set from data_resolver at first window
             self.regimes = sorted(
                 {
                     o.relpath.rsplit("/", 1)[-1].rsplit(".", 1)[0]
@@ -126,7 +117,6 @@ class WELL_FNO(BaseModelHarness):
                 }
             )
         else:
-            self._residency = None
             self._effective_base = self.base_path
             self.regimes = self._discover_regimes()
         print(f"Well regimes ({len(self.regimes)}): {self.regimes}")
@@ -239,7 +229,7 @@ class WELL_FNO(BaseModelHarness):
             repr((self.dataset_name, regime, entries)).encode()
         ).hexdigest()
 
-    # ----- residency -----
+    # ----- declarative data protocol -----
 
     def _regime_objects(self, regime: str) -> List[RemoteObject]:
         """The reservoir objects one regime window needs (data + stats.yaml)."""
@@ -260,6 +250,17 @@ class WELL_FNO(BaseModelHarness):
             repr((self.dataset_name, regime, entries)).encode()
         ).hexdigest()
 
+    def describe_window(self, window: int) -> Optional[WindowSpec]:
+        """Declare a window's needs: one regime's files plus stats.yaml."""
+        if not self.managed or window >= len(self.regimes):
+            return None
+        regime = self.regimes[window]
+        return WindowSpec(
+            objects=tuple(self._regime_objects(regime)),
+            fingerprint=self._managed_fingerprint(regime),
+            label=regime,
+        )
+
     # ----- stream protocol -----
 
     def update_data_stream(self) -> None:
@@ -267,12 +268,14 @@ class WELL_FNO(BaseModelHarness):
         regime = self.regimes[regime_idx]
         print(f"Well stream -> regime {regime_idx}: {regime}")
 
-        if self._residency is not None:
-            self._residency.ensure(self._regime_objects(regime), self._pin_owner)
-            if regime_idx + 1 < len(self.regimes):
-                self._residency.prefetch(
-                    self._regime_objects(self.regimes[regime_idx + 1])
-                )
+        if self.managed:
+            assert self.data_resolver is not None, (
+                "managed Well harness needs the framework data resolver "
+                "(run via src.main with an [experiment] section)"
+            )
+            self._effective_base = str(
+                self.data_resolver.store_root / "datasets" / self._org
+            )
             self.current_window_fingerprint = self._managed_fingerprint(regime)
         else:
             self.current_window_fingerprint = self._window_fingerprint(regime)

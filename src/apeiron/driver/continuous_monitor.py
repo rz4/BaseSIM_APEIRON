@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     from apeiron.experiment.journal import Journal
+    from apeiron.experiment.sources import WindowSpec
     from apeiron.model.torch_model_harness import BaseModelHarness
 
 
@@ -95,6 +96,10 @@ class ContinuousMonitor:
         # Metrics accumulation
         self.metric_buffer: list[list[float]] = []
 
+        # Last declared window spec (harnesses opting into the declarative
+        # data protocol); used for journaling and residency.
+        self._last_window_spec: "WindowSpec | None" = None
+
         self.logger.info("==== ContinuousMonitor initialized ====", level=0)
         self.logger.info(f"\tDetector: {cfg.drift_detection.detector_name}", level=1)
         self.logger.info(f"\tMonitoring metric index: {self.metric_idx}", level=1)
@@ -117,9 +122,10 @@ class ContinuousMonitor:
         # stream_update_count restored from its journal; the extra calls
         # fast-forward the harness to the window where monitoring stopped
         # (window sequences are deterministic, so this replays identically).
+        # Prefetch only fires for the window we will actually process.
         self.logger.info("\tInitializing first data stream...", level=1)
-        for _ in range(self.stream_update_count + 1):
-            self.modelHarness.update_data_stream()
+        for w in range(self.stream_update_count + 1):
+            self._advance_stream(w, prefetch_next=(w == self.stream_update_count))
         self._journal_window()
 
         while not self._should_stop():
@@ -359,20 +365,42 @@ class ContinuousMonitor:
         )
 
         # Load next data buffer
-        self.modelHarness.update_data_stream()
+        self._advance_stream(self.stream_update_count)
         self._journal_window()
+
+    def _advance_stream(self, window: int, prefetch_next: bool = True) -> None:
+        """Advance the harness one window, with managed residency when declared.
+
+        Harnesses that declare their windows (``describe_window`` returning a
+        WindowSpec) get the framework treatment: the window's objects are
+        materialized (pinned) BEFORE ``update_data_stream()`` builds loaders,
+        and the next window's objects are prefetched afterwards. Undeclared
+        harnesses just get ``update_data_stream()`` -- legacy behavior.
+        """
+        spec = self.modelHarness.describe_window(window)
+        resolver = self.modelHarness.data_resolver
+        if spec is not None and resolver is not None:
+            resolver.materialize(spec)
+        self._last_window_spec = spec
+        self.modelHarness.update_data_stream()
+        if prefetch_next and spec is not None and resolver is not None:
+            resolver.prefetch(self.modelHarness.describe_window(window + 1))
 
     def _journal_window(self) -> None:
         """Record a window advance, including harness window info if exposed."""
         if self.journal is None:
             return
+        spec = self._last_window_spec
         timerange = getattr(self.modelHarness, "current_window_timerange", None)
         self.journal.record(
             "window_started",
             batch_count=self.batch_count,
             stream_update_count=self.stream_update_count,
-            data_fingerprint=getattr(
-                self.modelHarness, "current_window_fingerprint", None
+            label=spec.label if spec is not None else None,
+            data_fingerprint=(
+                spec.fingerprint
+                if spec is not None
+                else getattr(self.modelHarness, "current_window_fingerprint", None)
             ),
             data_time_start=timerange[0] if timerange else None,
             data_time_end=timerange[1] if timerange else None,
