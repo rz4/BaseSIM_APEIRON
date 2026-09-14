@@ -100,6 +100,30 @@ class ContinuousMonitor:
         # data protocol); used for journaling and residency.
         self._last_window_spec: "WindowSpec | None" = None
 
+        # Resilience snapshots (experiment mode with snapshot_interval > 0):
+        # full-state bundles saved every N updates -- stream batches while
+        # monitoring, inner iterations during CL -- plus on interrupt signal.
+        self.snapshot_interval = (
+            cfg.experiment.snapshot_interval if cfg.experiment is not None else 0
+        )
+        self.snapshots = None
+        if self.snapshot_interval > 0 and cfg.model.ckpts_path:
+            from pathlib import Path
+
+            from apeiron.experiment.snapshot import SnapshotManager
+
+            self.snapshots = SnapshotManager(Path(cfg.model.ckpts_path) / "resilience")
+        self.batches_into_window = 0
+        self.interrupt_requested = False  # set by signal handlers
+        self._update_counter = 0
+        self._updates_since_snapshot = 0
+        self._resume_skip_batches = 0
+        self._resume_cl: dict | None = None
+        self._cl_ctx: dict | None = None
+        self._resumed_from_snapshot = False
+        self._pending_harness_rng: tuple | None = None
+        self.trainer.on_inner_step = self._on_cl_step
+
         self.logger.info("==== ContinuousMonitor initialized ====", level=0)
         self.logger.info(f"\tDetector: {cfg.drift_detection.detector_name}", level=1)
         self.logger.info(f"\tMonitoring metric index: {self.metric_idx}", level=1)
@@ -124,9 +148,33 @@ class ContinuousMonitor:
         # (window sequences are deterministic, so this replays identically).
         # Prefetch only fires for the window we will actually process.
         self.logger.info("\tInitializing first data stream...", level=1)
+        resume_skip = self._resume_skip_batches  # window reset clears it below
         for w in range(self.stream_update_count + 1):
             self._advance_stream(w, prefetch_next=(w == self.stream_update_count))
-        self._journal_window()
+        if not self._resumed_from_snapshot:
+            # The replayed window was journaled before the interruption;
+            # re-journaling it would break crash-equivalence.
+            self._journal_window()
+        self._resume_skip_batches = resume_skip
+        if self._pending_harness_rng is not None:
+            harness_rng, was_in_cl = self._pending_harness_rng
+            self._pending_harness_rng = None
+            self.modelHarness.load_rng_state_dict(harness_rng, in_cl=was_in_cl)
+
+        # A snapshot taken mid-CL: finish the interrupted CL loop first,
+        # then resume the stream at the batch where the drift had fired.
+        if self._resume_cl is not None:
+            resume = self._resume_cl
+            self._resume_cl = None
+            self.logger.info(
+                f"Resuming interrupted CL loop (event {resume['drift_event_id']}, "
+                f"iteration {resume['start_iter']})",
+                level=0,
+            )
+            self.trainer.outer_cl_training_loop(
+                drift_event_id=resume["drift_event_id"], resume=resume
+            )
+            self._post_cl()
 
         while not self._should_stop():
             try:
@@ -151,15 +199,26 @@ class ContinuousMonitor:
         """
         val_loader = self.modelHarness.get_stream_dataloader()
 
+        # On resume, replay the loader past the batches processed before the
+        # interruption (deterministic shuffles make positions reproducible);
+        # they are already reflected in the restored counters and buffer.
+        skip = self._resume_skip_batches
+        self._resume_skip_batches = 0
+
         for batch_idx, batch in tqdm(
             enumerate(val_loader),
             desc="Processing batches",
             leave=False,
         ):
+            if batch_idx < skip:
+                self.batches_into_window = batch_idx + 1
+                continue
+
             # Evaluate batch and compute all metrics
             metrics = self._evaluate_batch(batch)
             self.metric_buffer.append(metrics)
             self.batch_count += 1
+            self.batches_into_window += 1
 
             # Check drift at specified interval
             if (
@@ -170,6 +229,8 @@ class ContinuousMonitor:
 
                 if drift_signal.drift_detected:
                     self._handle_drift(drift_signal)
+
+            self._tick_snapshot(phase="monitor")
 
         raise StopIteration()
 
@@ -329,7 +390,10 @@ class ContinuousMonitor:
         self.trainer.outer_cl_training_loop(
             drift_event_id=self.drift_event_count,
         )
+        self._post_cl()
 
+    def _post_cl(self) -> None:
+        """After a CL loop (fresh or resumed): checkpoint, retention, reset."""
         if self.modelHarness.ckpts_enabled:
             ckptpath = self.modelHarness.save_ckpt(event=self.drift_event_count)
             self.logger.info(f"* Checkpoint saved to: {ckptpath}", level=0)
@@ -411,6 +475,7 @@ class ContinuousMonitor:
             resolver.materialize(spec)
         self._last_window_spec = spec
         self.modelHarness.update_data_stream()
+        self.batches_into_window = 0
         if prefetch_next and spec is not None and resolver is not None:
             resolver.prefetch(self.modelHarness.describe_window(window + 1))
 
@@ -432,6 +497,143 @@ class ContinuousMonitor:
             ),
             data_time_start=timerange[0] if timerange else None,
             data_time_end=timerange[1] if timerange else None,
+        )
+
+    # ----- resilience -----
+
+    def _on_cl_step(self, drift_event_id: int, iter_count: int, pre_metrics: dict):
+        """Trainer callback after each inner CL iteration (snapshot point)."""
+        self._cl_ctx = {
+            "drift_event_id": drift_event_id,
+            "iter_count": iter_count,
+            **pre_metrics,
+        }
+        self._tick_snapshot(phase="cl")
+        self._cl_ctx = None
+
+    def _tick_snapshot(self, phase: str) -> None:
+        """Count one update; snapshot on the interval or on interrupt.
+
+        On interrupt: save (regardless of the interval), journal
+        run_interrupted, and exit cleanly -- the walltime-signal path.
+        """
+        if self.snapshots is not None:
+            self._update_counter += 1
+            self._updates_since_snapshot += 1
+            if self.interrupt_requested or (
+                self._updates_since_snapshot >= self.snapshot_interval
+            ):
+                self._save_snapshot(phase)
+                self._updates_since_snapshot = 0
+        if self.interrupt_requested:
+            if self.journal is not None:
+                self.journal.record(
+                    "run_interrupted", batch_count=self.batch_count, phase=phase
+                )
+                self.journal.close()
+            self.logger.info(
+                "==== INTERRUPT: snapshot saved, exiting cleanly ====", level=0
+            )
+            raise SystemExit(0)
+
+    def _save_snapshot(self, phase: str) -> None:
+        import pickle
+
+        from apeiron.experiment.run import Run
+        from apeiron.experiment.snapshot import rng_states
+
+        assert self.snapshots is not None
+        state = {
+            "phase": phase,
+            "behavior_config_sha": Run._behavior_config_hash(self.cfg),
+            "batch_count": self.batch_count,
+            "stream_update_count": self.stream_update_count,
+            "drift_event_count": self.drift_event_count,
+            "batches_into_window": self.batches_into_window,
+            "metric_buffer": [list(m) for m in self.metric_buffer],
+            "cl": dict(self._cl_ctx) if phase == "cl" and self._cl_ctx else None,
+            "model": self.modelHarness.model.state_dict(),
+            "optimizer": self.trainer.optimizer.state_dict(),
+            "updater": self.trainer.cl_updater.state_dict(),
+            "detector": pickle.dumps(self.detector),
+            "rng": rng_states(),
+            "harness_rng": self.modelHarness.rng_state_dict(),
+            "journal_last_id": (
+                self.journal.last_id() if self.journal is not None else 0
+            ),
+            "task_records": self.modelHarness.task_records_refs(),
+        }
+        path = self.snapshots.save(state, step=self._update_counter)
+        if self.journal is not None:
+            self.journal.record(
+                "snapshot_saved",
+                batch_count=self.batch_count,
+                step=self._update_counter,
+                phase=phase,
+                path=str(path),
+            )
+
+    def restore_snapshot(self, state: dict) -> None:
+        """Restore full run state from a resilience snapshot (before run())."""
+        import pickle
+
+        from apeiron.experiment.run import Run
+        from apeiron.experiment.snapshot import restore_rng_states
+
+        # Roll the journal back to the snapshot's position: events past it
+        # were journaled between the snapshot and the crash and will be
+        # re-created identically by the deterministic replay.
+        if self.journal is not None and state.get("journal_last_id"):
+            dropped = self.journal.truncate_after(int(state["journal_last_id"]))
+            if dropped:
+                self.logger.info(
+                    f"[resume] rolled back {dropped} journal event(s) past the "
+                    "snapshot; replay re-creates them",
+                    level=0,
+                )
+
+        expected = Run._behavior_config_hash(self.cfg)
+        if state.get("behavior_config_sha") != expected:
+            self.logger.warning(
+                "[resume] behavior config differs from the snapshot's -- "
+                "the continuation will not be crash-equivalent"
+            )
+
+        self.batch_count = int(state["batch_count"])
+        self.stream_update_count = int(state["stream_update_count"])
+        self.drift_event_count = int(state["drift_event_count"])
+        self.metric_buffer = [list(m) for m in state["metric_buffer"]]
+        self._resume_skip_batches = int(state["batches_into_window"])
+        self._update_counter = int(state["step"])
+
+        self.modelHarness.model.load_state_dict(state["model"])
+        self.trainer.optimizer.load_state_dict(state["optimizer"])
+        self.trainer.cl_updater.load_state_dict(state["updater"])
+        self.detector = pickle.loads(state["detector"])
+        restore_rng_states(state["rng"])
+        if state.get("task_records") is not None:
+            self.modelHarness.restore_task_records(state["task_records"])
+        # Harness sampler epochs must be applied AFTER the window fast-forward
+        # rebuilds the loaders (run() does this via _pending_harness_rng).
+        self._pending_harness_rng = (
+            state.get("harness_rng") or {},
+            state["phase"] == "cl",
+        )
+        self._resumed_from_snapshot = True
+
+        if state["phase"] == "cl" and state.get("cl"):
+            cl = state["cl"]
+            self._resume_cl = {
+                "drift_event_id": int(cl["drift_event_id"]),
+                "start_iter": int(cl["iter_count"]) + 1,
+                "pre_cur_metrics": cl["pre_cur_metrics"],
+                "pre_hist_metrics": cl.get("pre_hist_metrics"),
+            }
+        self.logger.info(
+            f"Restored snapshot: step {self._update_counter}, phase "
+            f"{state['phase']}, window {self.stream_update_count}, "
+            f"batch {self.batch_count}",
+            level=0,
         )
 
     def _should_stop(self) -> bool:

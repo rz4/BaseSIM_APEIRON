@@ -61,14 +61,16 @@ class Experiment:
             try:
                 cl = j.events(kind="cl_finished")
                 last = cl[-1] if cl else {}
+                if j.events(kind="run_finished"):
+                    status = "finished"
+                elif j.events(kind="run_interrupted"):
+                    status = "interrupted"
+                else:
+                    status = "running-or-crashed"
                 infos.append(
                     RunInfo(
                         name=name,
-                        status=(
-                            "finished"
-                            if j.events(kind="run_finished")
-                            else "running-or-crashed"
-                        ),
+                        status=status,
                         continued=len(j.events(kind="run_continued")),
                         windows=len(j.events(kind="window_started")),
                         drift_events=len(j.events(kind="drift_detected")),

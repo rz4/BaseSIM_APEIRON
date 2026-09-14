@@ -80,10 +80,13 @@ class Journal:
     # Payload keys that legitimately differ between reruns of the same
     # experiment (allocation-dependent, not behavior-dependent).
     VOLATILE_KEYS = frozenset({"run_name", "original_config", "path"})
-    # Event kinds that record cache/transfer state rather than behavior:
-    # a cold and a warm rerun legitimately differ here (residency is cache
-    # state, not run state).
-    VOLATILE_KINDS = frozenset({"window_materialized"})
+    # Event kinds that record cache/transfer/resilience state rather than
+    # behavior: cold vs warm reruns differ in materialization, and an
+    # interrupted+resumed run differs from an uninterrupted one only in
+    # snapshot/interrupt/continue bookkeeping (crash-equivalence).
+    VOLATILE_KINDS = frozenset(
+        {"window_materialized", "snapshot_saved", "run_interrupted", "run_continued"}
+    )
 
     def signature(self) -> str:
         """Content hash of the run's behavior, for rerun comparison.
@@ -127,6 +130,24 @@ class Journal:
             "batch_count": max(batch_counts) if batch_counts else 0,
             "drift_event_count": (drifts[-1]["drift_event_id"] if drifts else 0),
         }
+
+    def last_id(self) -> int:
+        """Id of the newest event (0 if empty); recorded in snapshots."""
+        row = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()
+        return int(row[0])
+
+    def truncate_after(self, event_id: int) -> int:
+        """Checkpoint-recovery: drop events newer than ``event_id``.
+
+        A crash can leave events journaled AFTER the last snapshot (the
+        journal commits per event, snapshots every N updates). Restoring
+        rolls the journal back to the snapshot's position; deterministic
+        replay then re-creates the discarded tail identically. Returns the
+        number of events dropped.
+        """
+        cur = self._conn.execute("DELETE FROM events WHERE id > ?", (event_id,))
+        self._conn.commit()
+        return cur.rowcount
 
     def close(self) -> None:
         self._conn.close()

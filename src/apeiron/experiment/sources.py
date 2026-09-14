@@ -100,10 +100,17 @@ class HuggingFaceDatasetSource(Source):
         return objects
 
     def fetch(self, obj: RemoteObject, dest: Path) -> None:
+        import os
+        import threading
+
         from huggingface_hub import hf_hub_download
 
         repo_id, filename = self._parse(obj.uri)
-        tmp_root = dest.parent / f".fetch-{dest.name}"
+        # Unique per (process, thread) so concurrent fetches of the same
+        # object (bounded-wait fallback in the residency layer) never collide.
+        tmp_root = dest.parent / (
+            f".fetch-{os.getpid()}-{threading.get_ident()}-{dest.name}"
+        )
         got = hf_hub_download(
             repo_id=repo_id,
             repo_type="dataset",

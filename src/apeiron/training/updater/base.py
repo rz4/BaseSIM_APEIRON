@@ -81,3 +81,17 @@ class BaseUpdater:
     def update_post_optimizer_call(self) -> None:
         """Hook called after optimizer step to update internal state."""
         pass
+
+    # ----- resilience (state captured in snapshots for exact resume) -----
+
+    def state_dict(self) -> dict:
+        """Serializable updater memory (anchors, Fisher/KFAC factors, ...).
+
+        Captured at update boundaries only, so per-step transients need not
+        be included. Default: stateless.
+        """
+        return {}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore what :meth:`state_dict` captured. Default: nothing."""
+        pass

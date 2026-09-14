@@ -213,8 +213,10 @@ class TestRunReopen:
     def test_open_and_latest_checkpoint(self, default_cfg, tmp_path):
         cfg = replace(default_cfg, experiment=ExperimentCfg(path=str(tmp_path)))
         run = Run.create(cfg)
-        (run.run_dir / "checkpoints" / "drift_adaptation_1.pt").write_bytes(b"x")
-        (run.run_dir / "checkpoints" / "latest").write_text("drift_adaptation_1.pt")
+        analysis = run.run_dir / "checkpoints" / "analysis"
+        analysis.mkdir()
+        (analysis / "drift_adaptation_1.pt").write_bytes(b"x")
+        (analysis / "latest").write_text("drift_adaptation_1.pt")
         run.journal.record("window_started", batch_count=3, stream_update_count=1)
         run.finish()
 

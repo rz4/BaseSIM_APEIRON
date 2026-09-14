@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from apeiron.config.configuration import Config
 from apeiron.experiment import RemoteObject, get_source
-from apeiron.experiment.determinism import window_generator
+from apeiron.experiment.determinism import EpochSeededSampler
 from apeiron.experiment.sources import WindowSpec
 from apeiron.model.torch_model_harness import BaseModelHarness
 
@@ -123,6 +123,7 @@ class WELL_FNO(BaseModelHarness):
 
         self.task_counter = 0
         self.current_window_fingerprint: Optional[str] = None
+        self._samplers: Dict[str, EpochSeededSampler] = {}
         self._cur_train_loader: Optional[DataLoader] = None
         self._cur_val_loader: Optional[DataLoader] = None
         self._cur_stream_loader: Optional[DataLoader] = None
@@ -192,23 +193,43 @@ class WELL_FNO(BaseModelHarness):
     def _make_loader(
         self, ds: Dataset, batch_size: int, shuffle: bool, role: str = ""
     ) -> DataLoader:
-        # Shuffles are seeded per (run seed, window, role) so batch order is
-        # a pure function of the config -- the determinism contract that
-        # makes reruns byte-identical and continues replayable.
-        generator = (
-            window_generator(self.cfg.seed, self.task_counter, role)
+        # Shuffles use EpochSeededSampler: every epoch's permutation is a
+        # pure function of (run seed, window, role, epoch index), so batch
+        # order is fully determined by the config -- reruns are
+        # byte-identical and resilience snapshots only need each sampler's
+        # epoch counter (see rng_state_dict) to resume exactly.
+        n_samples: int = len(ds)  # type: ignore[arg-type]  # WellDataset is sized
+        sampler = (
+            EpochSeededSampler(n_samples, self.cfg.seed, self.task_counter, role)
             if shuffle
             else None
         )
+        if sampler is not None and role in ("train", "stream"):
+            # Persistent per-window loaders whose epoch counters are part
+            # of resilience snapshots; hist loaders are rebuilt per CL
+            # event and start fresh by design.
+            self._samplers[role] = sampler
         return DataLoader(
             ds,
             batch_size=batch_size,
-            shuffle=shuffle,
-            generator=generator,
+            sampler=sampler,
             num_workers=self.cfg.train.num_workers,
             collate_fn=well_collate,
             drop_last=False,
         )
+
+    def rng_state_dict(self) -> Dict[str, int]:
+        return {role: s.epochs_started for role, s in self._samplers.items()}
+
+    def load_rng_state_dict(self, state: Dict[str, int], in_cl: bool) -> None:
+        for role, epochs in state.items():
+            sampler = self._samplers.get(role)
+            if sampler is None:
+                continue
+            # "stream" is always mid-epoch at a snapshot (one epoch per
+            # window); "train" is mid-epoch only when snapshotted inside CL.
+            in_progress = role == "stream" or (role == "train" and in_cl)
+            sampler.epochs_started = max(0, epochs - 1) if in_progress else epochs
 
     def _window_fingerprint(self, regime: str) -> str:
         """Identity fingerprint of a window's data: file names + sizes.
@@ -319,6 +340,16 @@ class WELL_FNO(BaseModelHarness):
             ),
             self._make_loader(hist_val, self.cfg.train.batch_size, shuffle=False),
         )
+
+    def build_window_eval_loader(self, window: int) -> Optional[DataLoader]:
+        """Rebuild a past window's eval set (declarative task registry).
+
+        Deterministic: the window's regime + the valid split fully define
+        the data, so transfer metrics never need frozen in-memory copies.
+        """
+        regime = self.regimes[min(window, len(self.regimes) - 1)]
+        ds = self._make_dataset("valid", include=[regime])
+        return self._make_loader(ds, self.cfg.train.batch_size, shuffle=False)
 
     # ----- misc -----
 

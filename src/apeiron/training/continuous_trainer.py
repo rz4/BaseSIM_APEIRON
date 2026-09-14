@@ -40,6 +40,21 @@ class ContinuousTrainer:
 
         self.cl_updater = create_updater(cfg=self.cfg, modelHarness=self.modelHarness)
 
+        # Resilience hook: called after every inner CL iteration with
+        # (drift_event_id, iter_count, pre_metrics) so the monitor can
+        # snapshot mid-loop. None = no snapshotting.
+        self.on_inner_step: Optional[Any] = None
+
+    def _fast_forward(self, current_iter: Iterator, loader: DataLoader, n: int):
+        """Consume n batches (with wraparound) to replay loader position on resume."""
+        for _ in range(n):
+            try:
+                next(current_iter)
+            except StopIteration:
+                current_iter = iter(loader)
+                next(current_iter)
+        return current_iter
+
     def _safe_next(
         self,
         current_iter: Iterator,
@@ -130,8 +145,18 @@ class ContinuousTrainer:
     def outer_cl_training_loop(
         self,
         drift_event_id: int = 0,
+        resume: Optional[dict] = None,
     ) -> int:
-        """Run the outer continuous learning training loop for a drift event."""
+        """Run the outer continuous learning training loop for a drift event.
+
+        :param resume: mid-loop resume state from a resilience snapshot:
+            ``{"start_iter", "pre_cur_metrics", "pre_hist_metrics"}``. When
+            set, the pre-CL evals, cl_started journaling, and updater
+            preprocessing are skipped (they already happened before the
+            interruption) and the loader positions are fast-forwarded so
+            iteration ``start_iter`` consumes exactly the batches it would
+            have in an uninterrupted run.
+        """
         logger = get_logger(__name__)
         cur_train_loader, cur_test_loader = self.modelHarness.get_train_dataloaders()
         hist_train_loader, hist_test_loader = self.modelHarness.get_hist_dataloaders()
@@ -142,14 +167,31 @@ class ContinuousTrainer:
         else:
             hist_train_iter = None
 
-        cur_validation_metrics = self.modelHarness.eval()
-        hist_validation_metrics = self.modelHarness.history_eval()
+        start_iter = 0
+        if resume is None:
+            cur_validation_metrics = self.modelHarness.eval()
+            hist_validation_metrics = self.modelHarness.history_eval()
+        else:
+            start_iter = int(resume["start_iter"])
+            cur_validation_metrics = list(resume["pre_cur_metrics"])
+            hist_validation_metrics = (
+                list(resume["pre_hist_metrics"])
+                if resume.get("pre_hist_metrics") is not None
+                else None
+            )
+            # Replay loader positions consumed before the interruption
+            consumed = start_iter * self.cfg.train.grad_accumulation_steps
+            train_iter = self._fast_forward(train_iter, cur_train_loader, consumed)
+            if hist_train_iter is not None and hist_train_loader is not None:
+                hist_train_iter = self._fast_forward(
+                    hist_train_iter, hist_train_loader, consumed
+                )
 
         # R[i-1][i]: this window scored by the model that has not yet adapted to
         # it. Kept for the FWT delta once the post-CL score (R[i][i]) is in.
         pre_cl_validation_metrics = cur_validation_metrics
 
-        if self.journal is not None:
+        if self.journal is not None and resume is None:
             self.journal.record(
                 "cl_started",
                 drift_event_id=drift_event_id,
@@ -171,10 +213,18 @@ class ContinuousTrainer:
         self.modelHarness.model.train()
         # 2) run the outer loop
         desc = "CL Updates (drift_event_id={})".format(drift_event_id)
-        progress_bar = tqdm(range(self.cfg.train.max_iter), desc=desc, leave=True)
-        self.cl_updater.cl_preprocessing()
+        progress_bar = tqdm(
+            range(start_iter, self.cfg.train.max_iter), desc=desc, leave=True
+        )
+        if resume is None:
+            self.cl_updater.cl_preprocessing()
 
-        iter_count = self.cfg.train.max_iter
+        pre_metrics = {
+            "pre_cur_metrics": cur_validation_metrics,
+            "pre_hist_metrics": hist_validation_metrics,
+        }
+        # Init so an empty (fully-resumed) loop still reports max_iter iterations
+        iter_count = self.cfg.train.max_iter - 1
         if self.cl_updater is not None:  # default: do nothing
             for iter_count in progress_bar:
                 generation_loss, forgetting_loss = self.inner_cl_training_loop(
@@ -199,6 +249,9 @@ class ContinuousTrainer:
                 # Explicitly cleanup batch tensors to free GPU memory
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+                if self.on_inner_step is not None:
+                    self.on_inner_step(drift_event_id, iter_count, pre_metrics)
 
         self.cl_updater.cl_postprocessing()
 
@@ -253,7 +306,10 @@ class ContinuousTrainer:
 
         # Register *after* BWT so this event's window becomes task T only for
         # subsequent events -- R[T][T] belongs on the diagonal, not in the sum.
-        self.modelHarness.register_task(cur_validation_metrics)
+        self.modelHarness.register_task(
+            cur_validation_metrics,
+            window=getattr(self.modelHarness, "task_counter", 0) - 1,
+        )
 
         if self.profiler:
             flops_perf = self.profiler.get_performance()
