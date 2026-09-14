@@ -153,6 +153,51 @@ Harnesses whose loaders yield dict batches (rather than `(x, y)` tuples)
 should also override `batch_to_device` / `batch_size_of` if the defaults
 don't fit; the trainer routes all batch handling through these hooks.
 
+## Checkpoint retention policies
+
+With checkpointing enabled (`model.max_ckpts > 0`), the retention rule
+decides which post-CL snapshots survive the cap:
+
+```toml
+[model]
+max_ckpts = 3
+ckpt_retention = "best_hist"  # "latest" (default) | "best_current" | "best_hist"
+```
+
+- `latest` — newest N (the historical FIFO behavior).
+- `best_current` — best first-metric score on the window that triggered
+  each event (`cl_finished.post_cur_metrics[0]` in the journal).
+- `best_hist` — best first-metric score on the historical validation data.
+
+Regardless of policy, the newest checkpoint always survives (it is what
+`--continue-from` needs to match the stream position) and the `latest`
+pointer names it. Metric direction follows the harness's
+`higher_is_better` for its first metric. Metric-based policies read
+scores from the run journal, so they need experiment mode; without it
+they fall back to `latest` with a warning. Evictions are journaled as
+`checkpoints_evicted` events.
+
+## The experiment workspace
+
+Summarize an experiment's runs (and its artifact store) from their
+journals:
+
+```bash
+python -m apeiron.experiment experiments/my_experiment            # report
+python -m apeiron.experiment experiments/my_experiment --gc-pins  # + stale-pin GC
+```
+
+`--gc-pins` releases artifact pins held by runs that already finished or
+whose directory is gone (a crashed run never reaches its pin-release
+step, and stale pins block eviction). The same view is available in
+Python via `apeiron.experiment.Experiment`.
+
+Control-arm runs (`src.cl_only`) accept the same `[experiment]` section
+and land in the same workspace as the detector runs they are compared
+against — same determinism contract, same managed data residency (their
+declared windows are materialized up front, since a schedule run visits
+every window). Their journals carry a final `schedule_summary` event.
+
 ## Determinism and reruns
 
 `src.main` seeds torch, numpy, and the stdlib RNG from the top-level `seed`

@@ -62,7 +62,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from apeiron.config.configuration import build_config, Config
+from apeiron.config.configuration import build_config, parse_args, Config
+from apeiron.experiment import Run
+from apeiron.experiment.determinism import seed_everything
+from apeiron.experiment.residency import DataResolver
 from apeiron.logger import get_logger, configure_backend
 from apeiron.model.torch_model_harness import BaseModelHarness
 from apeiron.profilers import FLOPSProfiler
@@ -570,9 +573,16 @@ def main(argv: list[str] | None = None) -> int:
     args, remaining = build_parser().parse_known_args(argv)
 
     cfg: Config = build_config(remaining)
-    modelHarness = get_example(cfg=cfg)
 
-    schedule = make_schedule(args, cfg)
+    # Experiment mode: control-arm runs live in the same workspace (and
+    # under the same determinism contract) as the detector runs they are
+    # compared against. See docs/experiment.md.
+    run: Run | None = None
+    if cfg.experiment is not None:
+        run = Run.create(cfg, original_config=parse_args(remaining).config)
+        cfg = run.bind(cfg)
+
+    seed_everything(cfg.seed)
 
     backend = configure_backend(cfg)
     logger = get_logger(
@@ -581,6 +591,23 @@ def main(argv: list[str] | None = None) -> int:
         csv_path=cfg.logging.metrics_output_path if cfg.logging else None,
     )
 
+    modelHarness = get_example(cfg=cfg)
+    if run is not None:
+        resolver = DataResolver.for_run(cfg, run)
+        modelHarness.data_resolver = resolver
+        # This runner drives its own stream loop (no ContinuousMonitor), so
+        # declared windows are materialized up front rather than per window.
+        # Bounded by the run's horizon: only the windows this run will
+        # actually visit, not everything the harness can enumerate.
+        horizon = cfg.drift_detection.max_stream_updates + 1
+        for window in range(horizon):
+            spec = modelHarness.describe_window(window)
+            if spec is None:
+                break
+            resolver.materialize(spec)
+
+    schedule = make_schedule(args, cfg)
+
     project_name = "basesim-framework"
     if cfg.logging and cfg.logging.experiment_name:
         project_name = cfg.logging.experiment_name
@@ -588,6 +615,13 @@ def main(argv: list[str] | None = None) -> int:
     logger.init(cfg, project=project_name)
 
     summary = run_manual_cl(cfg=cfg, modelHarness=modelHarness, schedule=schedule)
+
+    if run is not None:
+        # summary's own keys win on collision (it already carries "schedule")
+        run.journal.record(
+            "schedule_summary", **{"schedule_repr": str(schedule), **summary}
+        )
+        run.finish()
 
     logger.finish()
 

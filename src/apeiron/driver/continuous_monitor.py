@@ -340,6 +340,34 @@ class ContinuousMonitor:
                     drift_event_id=self.drift_event_count,
                     path=ckptpath,
                 )
+            if self.cfg.model.ckpt_retention != "latest":
+                from apeiron.experiment.retention import apply_retention
+
+                deleted = apply_retention(
+                    self.cfg.model.ckpts_path,
+                    max_ckpts=self.cfg.model.max_ckpts,
+                    policy=self.cfg.model.ckpt_retention,
+                    journal=self.journal,
+                    higher_is_better=next(
+                        iter(
+                            getattr(self.modelHarness, "higher_is_better", {}).values()
+                        ),
+                        True,
+                    ),
+                )
+                if deleted:
+                    self.logger.info(
+                        f"* Retention ({self.cfg.model.ckpt_retention}) evicted: "
+                        f"{', '.join(deleted)}",
+                        level=1,
+                    )
+                    if self.journal is not None:
+                        self.journal.record(
+                            "checkpoints_evicted",
+                            drift_event_id=self.drift_event_count,
+                            policy=self.cfg.model.ckpt_retention,
+                            deleted=deleted,
+                        )
 
         self.logger.info("<- Continual learning complete.", level=0)
 
