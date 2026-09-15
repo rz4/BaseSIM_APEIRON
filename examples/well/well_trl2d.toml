@@ -1,0 +1,52 @@
+# well_trl2d.toml -- The Well: turbulent_radiative_layer_2D
+#
+# Streams the tcool parameter sweep (9 regimes, tcool 0.03 -> 3.16) past the
+# pretrained Well FNO baseline, monitoring VRMSE for drift and adapting with
+# replay on detection.
+#
+# data.path options:
+#   "hf://datasets/polymathic-ai/"  -- stream from Hugging Face (no download;
+#                                      fine for smoke tests, slow for real runs)
+#   "<local dir>"                   -- after: the-well-download --base-path <dir> \
+#                                      --dataset turbulent_radiative_layer_2D
+seed = 1337
+device = "cpu"  # FNO uses complex FFTs; MPS lacks complex support. Use cuda if available.
+multi_gpu = false
+verbosity = "INFO"
+
+[model]
+name = "fno"
+pretrained_path = "polymathic-ai/FNO-turbulent_radiative_layer_2D"
+max_ckpts = 0  # increment to enable post-CL checkpointing
+ckpts_path = "output/well_trl2d/"
+
+[data]
+name = "well:turbulent_radiative_layer_2D"
+path = "hf://datasets/polymathic-ai/"
+batch_size = 4  # streaming batch size
+
+[train]
+batch_size = 8
+num_workers = 0  # keep 0 for hf:// streaming
+init_lr = 5e-4
+max_iter = 50  # CL iterations per drift event
+grad_accumulation_steps = 1
+
+[continual_learning]
+update_mode = "base"
+mix_historic_data = true  # replay prior regimes through the combined batch
+
+[drift_detection]
+detector_name = "ADWINDetector"
+detection_interval = 5  # check drift every 5 stream batches
+aggregation = "mean"
+metric_index = 0  # 0 = vrmse (lower is better), 1 = loss
+reset_after_learning = false
+max_stream_updates = 9  # one window per tcool regime
+
+adwin_delta = 0.05
+
+[logging]
+backend = "none"
+experiment_name = "well-trl2d-continual"
+metrics_output_path = "output/well_trl2d.csv"
