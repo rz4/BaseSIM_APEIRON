@@ -38,6 +38,7 @@ The installable package lives under `src/apeiron/` (imported as `apeiron`; see `
 7. **Evaluation** (`src/apeiron/evaluation/metrics.py`): `accuracy()` and `accuracy_topk()`.
 8. **Logger** (`src/apeiron/logger/`): `Logger` with pluggable metrics backends -- `WandBLogger` and `MLFlowLogger` (configured via `[logging] backend = "wandb"|"mlflow"|"none"`), plus console output. Stages: eval, drift, cl. Metrics are written to a CSV file at `[logging] metrics_output_path` for external analysis.
 9. **Profilers** (`src/apeiron/profilers/`): `FLOPSProfiler` (`count_flops.py`) using PyTorch FlopCounterMode.
+10. **Experiment runs** (`src/apeiron/experiment/`): `Run` (bounded run directories under `[experiment] path`/runs/ holding the original + resolved config, metrics CSV, log, checkpoints, and a signature) and `Journal` (append-only SQLite event log: windows, every drift check, drift events, checkpoints; `signature()` compares two runs). Config-gated: no `[experiment]` section = legacy behavior. See `docs/experiment.md`.
 
 ### Example Harnesses
 - `examples/mnist/model.py`: `MNIST_CNN` -- CNN on MNIST with affine drift simulation.
@@ -47,7 +48,7 @@ The installable package lives under `src/apeiron/` (imported as `apeiron`; see `
 
 ### Configuration Format (TOML)
 Required sections: `[model]` (name, pretrained_path), `[data]` (name, path), `[train]` (batch_size, num_workers, init_lr), `[drift_detection]` (detector_name, detection_interval, etc).
-Optional sections: `[continual_learning]` (update_mode, lambda params), `[logging]` (backend = "wandb"|"mlflow"|"none", experiment_name, mlflow_tracking_uri, metrics_output_path).
+Optional sections: `[continual_learning]` (update_mode, lambda params), `[logging]` (backend = "wandb"|"mlflow"|"none", experiment_name, mlflow_tracking_uri, metrics_output_path), `[experiment]` (path, run_name -- bounded run directories + event log).
 Top-level keys: `seed`, `device` ("auto"|"cpu"|"cuda"|"mps"), `multi_gpu`.
 
 ### Available Drift Detectors

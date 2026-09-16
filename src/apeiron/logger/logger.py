@@ -129,6 +129,10 @@ class Logger:
     def verbosity(self, level: str) -> None:
         self._console.verbosity = level
 
+    def add_log_file(self, path: str | Path) -> None:
+        """Mirror console output into a file."""
+        self._console.add_file(path)
+
     def debug(self, msg: str, *args, **kwargs) -> None:
         self._console.debug(msg, *args, **kwargs)
 

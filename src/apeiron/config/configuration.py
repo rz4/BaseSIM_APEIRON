@@ -193,6 +193,19 @@ class LoggingCfg:
 
 
 @dataclass(frozen=True)
+class ExperimentCfg:
+    """Opt-in bounded run directories.
+
+    With this section present, each run gets its own directory under
+    ``<path>/runs/`` holding its config, event log, metrics, log and
+    checkpoints. Without it, apeiron writes where it always did.
+    """
+
+    path: str  # experiment directory; runs are allocated under <path>/runs/
+    run_name: str = ""  # optional label appended to the allocated directory name
+
+
+@dataclass(frozen=True)
 class Config:
     model: ModelCfg
     data: DataCfg
@@ -205,6 +218,7 @@ class Config:
     multi_gpu: bool = False
     verbosity: str = "INFO"
     logging: LoggingCfg | None = None
+    experiment: ExperimentCfg | None = None
 
 
 def parse_args(argv=None):
@@ -358,6 +372,7 @@ def build_config(argv=None) -> Config:
     dd = DriftDetectionCfg(**cfg["drift_detection"])
     cl = ContinualLearningCfg(**cfg.get("continual_learning", {}))
     log_cfg = LoggingCfg(**cfg["logging"]) if "logging" in cfg else None
+    exp_cfg = ExperimentCfg(**cfg["experiment"]) if "experiment" in cfg else None
 
     raw_device = str(
         cfg.get(
@@ -380,6 +395,7 @@ def build_config(argv=None) -> Config:
         "continual_learning",
         "drift_detection",
         "logging",
+        "experiment",
         "device",
         "multi_gpu",
     }
@@ -394,10 +410,14 @@ def build_config(argv=None) -> Config:
         continual_learning=cl,
         drift_detection=dd,
         logging=log_cfg,
+        experiment=exp_cfg,
         device=resolved_device,
         multi_gpu=multi_gpu_flag,
         **extras,
     )
 
-    Path("resolved_config.json").write_text(json.dumps(asdict(final), indent=2))
+    if final.experiment is None:
+        # Legacy behavior. With an [experiment] section the resolved config is
+        # written into the run directory instead of the working directory.
+        Path("resolved_config.json").write_text(json.dumps(asdict(final), indent=2))
     return final

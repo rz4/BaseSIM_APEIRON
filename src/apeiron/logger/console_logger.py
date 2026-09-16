@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 from typing import Callable
 
 
@@ -141,6 +142,22 @@ class ConsoleLogger:
         self._logger.setLevel(log_level)
         for handler in self._logger.handlers:
             handler.setLevel(log_level)
+
+    def add_file(self, path: str | Path) -> None:
+        """Also write console output to a file. Idempotent per path."""
+        target = str(Path(path).resolve())
+        for h in self._logger.handlers:
+            if isinstance(h, logging.FileHandler):
+                if str(Path(h.baseFilename).resolve()) == target:
+                    return
+
+        log_level = self._get_log_level(self._verbosity)
+        handler = logging.FileHandler(target, encoding="utf-8")
+        handler.setLevel(log_level)
+        # Plain formatter: the colored one writes ANSI escapes into the file.
+        handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=TIME_FORMAT))
+        handler.addFilter(StepFilter(self._get_step))
+        self._logger.addHandler(handler)
 
     def debug(self, msg: str, *args, **kwargs) -> None:
         self._logger.debug(msg, *args, stacklevel=3, **kwargs)

@@ -86,6 +86,7 @@ drift_detectors
 choosing_a_detector
 continuous_learning
 tracking
+experiment
 ```
 
 ```{toctree}

@@ -9,6 +9,7 @@ This module implements a continuous monitoring architecture that:
 """
 
 from __future__ import annotations
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,6 +24,7 @@ from apeiron.training import ContinuousTrainer
 from tqdm import tqdm
 
 if TYPE_CHECKING:
+    from apeiron.experiment import Run
     from apeiron.model.torch_model_harness import BaseModelHarness
 
 
@@ -49,17 +51,21 @@ class ContinuousMonitor:
         self,
         cfg: Config,
         modelHarness: BaseModelHarness,
+        run: Run | None = None,
     ):
         """Initialize continuous monitor.
 
         Args:
             cfg: Configuration object
             modelHarness: Model harness containing model and data loaders
-            logger: Logger for metrics
+            run: Optional run directory; when given, the loop records what it
+                does to the run's event log. None reproduces legacy behavior.
         """
         self.cfg = cfg
         self.modelHarness = modelHarness
         self.logger = get_logger()
+        # `run()` is the monitoring loop, so the collaborator is kept private.
+        self._run = run
 
         # Create persistent detector instance
         self.detector = load_drift_detector(cfg)
@@ -98,6 +104,11 @@ class ContinuousMonitor:
         self.logger.info(f"\tAggregation method: {self.aggregation}", level=1)
         self.logger.info(f"\tMax stream updates: {self.max_stream_updates}", level=1)
 
+    def _record(self, kind: str, **payload: object) -> None:
+        """Append an event to the run's log. No-op without a run directory."""
+        if self._run is not None:
+            self._run.record(kind, **payload)
+
     def run(self) -> None:
         """Main continuous monitoring loop.
 
@@ -110,6 +121,7 @@ class ContinuousMonitor:
         # Initialize first data stream
         self.logger.info("\tInitializing first data stream...", level=1)
         self.modelHarness.update_data_stream()
+        self._record("window", index=self.stream_update_count)
 
         while not self._should_stop():
             try:
@@ -250,6 +262,17 @@ class ContinuousMonitor:
         # Log drift metrics
         self._log_metrics(drift_signal, agg_metric)
 
+        # Every check, including the ones that found nothing: the log is a
+        # record of decisions, not a sample of them.
+        self._record(
+            "drift_check",
+            window=self.stream_update_count,
+            batch=self.batch_count,
+            value=agg_metric,
+            detected=bool(drift_signal.drift_detected),
+            score=drift_signal.drift_score,
+        )
+
         return drift_signal
 
     def _handle_drift(self, drift_signal: DriftSignal) -> None:
@@ -262,6 +285,14 @@ class ContinuousMonitor:
             drift_signal: The drift signal from the detector
         """
         self.drift_event_count += 1
+        self._record(
+            "drift",
+            event=self.drift_event_count,
+            window=self.stream_update_count,
+            batch=self.batch_count,
+            score=drift_signal.drift_score,
+            regime=(drift_signal.regime.value if drift_signal.regime else None),
+        )
         self.logger.info(
             f"==== DRIFT DETECTED (Event #{self.drift_event_count})! ====", level=0
         )
@@ -294,6 +325,12 @@ class ContinuousMonitor:
         if self.modelHarness.ckpts_enabled:
             ckptpath = self.modelHarness.save_ckpt(event=self.drift_event_count)
             self.logger.info(f"* Checkpoint saved to: {ckptpath}", level=0)
+            self._record(
+                "checkpoint",
+                event=self.drift_event_count,
+                name=Path(ckptpath).name,
+                path=ckptpath,
+            )
 
         self.logger.info("<- Continual learning complete.", level=0)
 
@@ -320,6 +357,7 @@ class ContinuousMonitor:
 
         # Load next data buffer
         self.modelHarness.update_data_stream()
+        self._record("window", index=self.stream_update_count)
 
     def _should_stop(self) -> bool:
         """Check if monitoring should stop.
