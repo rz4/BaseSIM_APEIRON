@@ -34,6 +34,9 @@ def main(argv: list[str] | None = None) -> int:
 
     modelHarness = get_example(cfg=cfg)
 
+    if run is not None:
+        run.record_model(modelHarness)
+
     # Determine project/experiment name
     project_name = "basesim-framework"
     if cfg.logging and cfg.logging.experiment_name:

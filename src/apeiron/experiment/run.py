@@ -6,6 +6,7 @@ under ``<experiment path>/runs/run_NNNN``::
     run_0001/
       config.toml           copy of the config file that was passed
       config.resolved.json  the config that actually ran, after overrides
+      model.json            what model was used: class, shapes, hyperparameters
       journal.sqlite        event log
       metrics.csv           existing apeiron output, pointed here
       log.txt               console output
@@ -29,8 +30,14 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from typing import TYPE_CHECKING, Any
+
 from apeiron.config.configuration import Config
 from apeiron.experiment.journal import Journal
+from apeiron.experiment.model_info import describe_model, summarize
+
+if TYPE_CHECKING:
+    from apeiron.model.torch_model_harness import BaseModelHarness
 
 _RUN_DIR_RE = re.compile(r"^run_(\d+)")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -160,6 +167,19 @@ class Run:
     # -- events -------------------------------------------------------------
     def record(self, kind: str, **payload: object) -> int:
         return self.journal.record(kind, **payload)
+
+    def record_model(self, harness: BaseModelHarness) -> dict[str, Any]:
+        """Write ``model.json`` and log what model this run is using.
+
+        The event carries everything except the per-tensor table, so the
+        architecture takes part in the signature: a harness change that alters
+        the network shows up as a different run even though the config is
+        unchanged.
+        """
+        description = describe_model(harness)
+        (self.run_dir / "model.json").write_text(json.dumps(description, indent=2))
+        self.record("model", **summarize(description))
+        return description
 
     def finish(self, status: str = "finished") -> str:
         """Close the run: record how it ended and write ``signature.txt``."""

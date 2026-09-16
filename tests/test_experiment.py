@@ -8,11 +8,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from torch import nn
 
 from apeiron.config.configuration import Config, ExperimentCfg, build_config
 from apeiron.drift_detection.detectors.base import DriftSignal, LearningRegime
 from apeiron.driver.continuous_monitor import ContinuousMonitor
-from apeiron.experiment import Journal, Run, behavior_hash
+from apeiron.experiment import Journal, Run, behavior_hash, describe_model
 
 
 def _exp_cfg(cfg: Config, tmp_path: Path, **kw) -> Config:
@@ -378,3 +379,133 @@ class TestMonitorRecords:
         assert ckpt is not None
         assert ckpt.payload["name"] == "drift_adaptation_1.pt"
         run.finish()
+
+
+# ---------------------------------------------------------------------------
+# model description
+# ---------------------------------------------------------------------------
+class TestDescribeModel:
+    def test_default_hook_is_empty(self, dummy_harness):
+        assert dummy_harness.model_config() == {}
+
+    def test_derived_fields(self, dummy_harness):
+        d = describe_model(dummy_harness)
+        assert d["class"] == "TinyModel"
+        assert d["harness_class"] == "DummyHarness"
+        assert d["name"] == dummy_harness.cfg.model.name
+        # TinyModel is Linear(4, 3): 12 weights + 3 biases
+        assert d["parameters"] == {"total": 15, "trainable": 15}
+        assert [t["name"] for t in d["tensors"]] == ["fc.weight", "fc.bias"]
+        assert d["tensors"][0]["shape"] == [3, 4]
+        assert len(d["shapes_sha256"]) == 64
+
+    def test_hook_value_is_carried(self, default_cfg, make_harness):
+        harness = make_harness(default_cfg)
+        with patch.object(
+            type(harness), "model_config", lambda self: {"width": 4, "depth": 1}
+        ):
+            assert describe_model(harness)["config"] == {"width": 4, "depth": 1}
+
+    def test_same_architecture_same_hash(self, default_cfg, make_harness):
+        # Two harnesses with independently initialised weights: same shapes,
+        # so the same hash. The hash is about structure, not values.
+        a = describe_model(make_harness(default_cfg))
+        b = describe_model(make_harness(default_cfg))
+        assert a["shapes_sha256"] == b["shapes_sha256"]
+
+    def test_different_architecture_different_hash(self, default_cfg, make_harness):
+        a = describe_model(make_harness(default_cfg))
+        b = describe_model(make_harness(default_cfg, model=nn.Linear(8, 3)))
+        assert a["shapes_sha256"] != b["shapes_sha256"]
+
+    def test_wrapped_model_is_unwrapped(self, default_cfg, make_harness):
+        from apeiron.experiment.model_info import unwrap
+
+        harness = make_harness(default_cfg)
+        plain = describe_model(harness)
+        harness.model = nn.DataParallel(harness.model)
+        assert unwrap(harness.model) is not harness.model
+        wrapped = describe_model(harness)
+        assert wrapped["class"] == plain["class"] == "TinyModel"
+        assert wrapped["shapes_sha256"] == plain["shapes_sha256"]
+
+    def test_pretrained_absent_and_present(self, default_cfg, make_harness, tmp_path):
+        assert describe_model(make_harness(default_cfg))["pretrained"] is None
+
+        weights = tmp_path / "w.pth"
+        weights.write_bytes(b"0123456789")
+        cfg = replace(
+            default_cfg, model=replace(default_cfg.model, pretrained_path=str(weights))
+        )
+        d = describe_model(make_harness(cfg))
+        assert d["pretrained"]["exists"] is True
+        assert d["pretrained"]["size"] == 10
+
+        missing = replace(
+            default_cfg, model=replace(default_cfg.model, pretrained_path="/nope.pth")
+        )
+        d = describe_model(make_harness(missing))
+        assert d["pretrained"] == {"path": "/nope.pth", "exists": False}
+
+
+class TestRecordModel:
+    def test_writes_file_and_event(self, default_cfg, dummy_harness, tmp_path):
+        run = Run.create(_exp_cfg(default_cfg, tmp_path))
+        run.record_model(dummy_harness)
+
+        on_disk = json.loads((run.run_dir / "model.json").read_text())
+        assert on_disk["class"] == "TinyModel"
+        assert len(on_disk["tensors"]) == 2
+
+        event = run.journal.last("model")
+        assert event is not None
+        assert event.payload["shapes_sha256"] == on_disk["shapes_sha256"]
+        # the bulky table stays out of the log
+        assert "tensors" not in event.payload
+        run.finish()
+
+    def test_mtime_left_out_of_the_event(self, default_cfg, make_harness, tmp_path):
+        weights = tmp_path / "w.pth"
+        weights.write_bytes(b"0123456789")
+        cfg = _exp_cfg(
+            replace(
+                default_cfg,
+                model=replace(default_cfg.model, pretrained_path=str(weights)),
+            ),
+            tmp_path,
+        )
+        run = Run.create(cfg)
+        run.record_model(make_harness(cfg))
+        event = run.journal.last("model")
+        assert event is not None
+        assert "mtime" not in event.payload["pretrained"]
+        assert event.payload["pretrained"]["size"] == 10
+        assert (
+            "mtime"
+            in json.loads((run.run_dir / "model.json").read_text())["pretrained"]
+        )
+        run.finish()
+
+    def test_architecture_change_changes_the_signature(
+        self, default_cfg, make_harness, tmp_path
+    ):
+        cfg = _exp_cfg(default_cfg, tmp_path)
+        sigs = []
+        for model in (nn.Linear(4, 3), nn.Linear(8, 3)):
+            run = Run.create(cfg)
+            run.record_model(make_harness(cfg, model=model))
+            run.record("window", index=0)
+            sigs.append(run.finish())
+        assert sigs[0] != sigs[1]
+
+    def test_same_architecture_same_signature(
+        self, default_cfg, make_harness, tmp_path
+    ):
+        cfg = _exp_cfg(default_cfg, tmp_path)
+        sigs = []
+        for _ in range(2):
+            run = Run.create(cfg)
+            run.record_model(make_harness(cfg, model=nn.Linear(4, 3)))
+            run.record("window", index=0)
+            sigs.append(run.finish())
+        assert sigs[0] == sigs[1]

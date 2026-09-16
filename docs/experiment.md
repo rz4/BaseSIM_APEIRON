@@ -18,6 +18,7 @@ experiments/mnist_drift/
     run_0001/
       config.toml            copy of the config file passed to --config
       config.resolved.json   the config that actually ran, after --set and APP_ overrides
+      model.json             what model was used
       journal.sqlite         event log
       metrics.csv            the [logging] metrics CSV
       log.txt                console output
@@ -36,6 +37,40 @@ startup to point inside the run directory; their values in the config file are
 ignored in experiment mode. `metrics.csv` appears only when the config has a
 `[logging]` section.
 
+## Model record
+
+`model.json` records what the config cannot: the architecture lives in the
+harness source, so `[model] name = "dummy"` and a path to weights is not enough
+to reload a checkpoint later or to tell two runs apart.
+
+Most of it is derived from the model with no cooperation from the harness:
+
+| field | meaning |
+|---|---|
+| `class`, `module` | the model class, with `DataParallel`/DDP unwrapped |
+| `harness_class`, `harness_module` | the harness that built it |
+| `parameters` | total and trainable parameter counts |
+| `tensors` | every state-dict entry: name, shape, dtype |
+| `shapes_sha256` | hash of that table -- equal hashes load each other's weights |
+| `pretrained` | path, size and mtime of the weights file, if any |
+| `config` | whatever the harness returns from `model_config()` |
+
+The framework can see a network's shape but not the choices behind it. A
+harness that constructs its model from arguments should return them:
+
+```python
+class WELL_FNO(BaseModelHarness):
+    def model_config(self) -> dict:
+        return {"modes": 16, "width": 64, "n_steps_input": 4}
+```
+
+The default returns `{}`, so existing harnesses need no change.
+
+Everything except the `tensors` table is also written to the event log, which
+means the architecture takes part in the run signature: a change to harness
+code that alters the network compares as a different run even though the config
+file is untouched.
+
 ## Event log
 
 `journal.sqlite` holds one table:
@@ -53,6 +88,7 @@ up to the moment it died.
 | kind | payload | when |
 |---|---|---|
 | `run_started` | `run_dir`, `config_sha256`, `hostname`, `pid` | run directory allocated |
+| `model` | the model record, without the `tensors` table | harness built |
 | `window` | `index` | after each `update_data_stream()` |
 | `drift_check` | `window`, `batch`, `value`, `detected`, `score` | every drift check, including negative ones |
 | `drift` | `event`, `window`, `batch`, `score`, `regime` | drift detected, before training starts |

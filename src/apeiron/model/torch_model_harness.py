@@ -218,6 +218,20 @@ class BaseModelHarness(ABC):
         """
         return [diagonal for _, diagonal in self._task_records]
 
+    def model_config(self) -> Dict[str, Any]:
+        """Return the model's own hyperparameters, if it has any worth keeping.
+
+        The framework can see the network's shape but not the choices behind it
+        (layer widths, mode counts, window sizes). Subclasses that construct a
+        model from such arguments should return them here as a plain
+        JSON-serialisable dict; they are stored with the run.
+
+        Returns
+        -------
+        By default, an empty dict.
+        """
+        return {}
+
     @property
     def ckpts_enabled(self) -> bool:
         return self.cfg.model.max_ckpts > 0 and bool(self.cfg.model.ckpts_path)

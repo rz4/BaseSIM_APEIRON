@@ -5,6 +5,14 @@ this module is constructed and apeiron behaves exactly as it did before.
 """
 
 from apeiron.experiment.journal import Event, Journal
+from apeiron.experiment.model_info import describe_model, shapes_hash
 from apeiron.experiment.run import Run, behavior_hash
 
-__all__ = ["Event", "Journal", "Run", "behavior_hash"]
+__all__ = [
+    "Event",
+    "Journal",
+    "Run",
+    "behavior_hash",
+    "describe_model",
+    "shapes_hash",
+]
