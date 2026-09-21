@@ -168,6 +168,23 @@ class TestRunLayout:
         assert (run.run_dir / "config.toml").read_text() == src.read_text()
         run.finish()
 
+    def test_name_groups_runs(self, default_cfg, tmp_path):
+        cfg = _exp_cfg(default_cfg, tmp_path, name="well_drift")
+        first = Run.create(cfg)
+        second = Run.create(cfg)
+        assert first.run_dir == tmp_path / "well_drift" / "run_0001"
+        assert second.run_dir == tmp_path / "well_drift" / "run_0002"
+        # a different experiment numbers from one again, alongside it
+        other = Run.create(_exp_cfg(default_cfg, tmp_path, name="mnist_smoke"))
+        assert other.run_dir == tmp_path / "mnist_smoke" / "run_0001"
+        for run in (first, second, other):
+            run.finish()
+
+    def test_name_is_sanitised(self, default_cfg, tmp_path):
+        run = Run.create(_exp_cfg(default_cfg, tmp_path, name="../escape"))
+        assert run.run_dir == tmp_path / "escape" / "run_0001"
+        run.finish()
+
     def test_ignores_unrelated_contents(self, default_cfg, tmp_path):
         (tmp_path / "mnist.csv").write_text("x")
         (tmp_path / "some_dir").mkdir()
@@ -300,6 +317,7 @@ class TestConfigSection:
         cfg = build_config(["--config", str(toml)])
         assert cfg.experiment is not None
         assert cfg.experiment.path == "output"
+        assert cfg.experiment.name == ""
         assert cfg.experiment.run_name == ""
 
     def test_present_section_parsed(self, tmp_path, monkeypatch):

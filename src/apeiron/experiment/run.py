@@ -1,8 +1,8 @@
 """The run directory: one self-contained directory per run.
 
 Everything a run reads that is not data, and everything a run writes, lives
-under ``<experiment path>/run_NNNN``. The path is any directory; runs are
-allocated inside it and anything else already there is left alone::
+under ``<path>/<experiment name>/run_NNNN``, so the runs of one experiment sit
+together. Anything else already in that directory is left alone::
 
     run_0001/
       config.toml           copy of the config file that was passed
@@ -49,7 +49,12 @@ MAX_ALLOC_ATTEMPTS = 100
 
 
 def _safe_name(name: str) -> str:
-    return _SAFE_NAME_RE.sub("-", name).strip("-")
+    """Turn a user-supplied label into one safe path segment.
+
+    Separators become dashes and leading dots are dropped, so a name can
+    neither escape its directory nor produce a hidden one.
+    """
+    return _SAFE_NAME_RE.sub("-", name).strip("-.")
 
 
 def _next_index(root: Path) -> int:
@@ -89,6 +94,8 @@ class Run:
             raise ValueError("Run.create requires an [experiment] section")
 
         root = Path(cfg.experiment.path).expanduser()
+        if name := _safe_name(cfg.experiment.name):
+            root = root / name
         root.mkdir(parents=True, exist_ok=True)
 
         suffix = _safe_name(cfg.experiment.run_name)
