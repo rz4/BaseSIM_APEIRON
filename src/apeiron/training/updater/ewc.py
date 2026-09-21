@@ -45,6 +45,23 @@ class OnlineEWCUpdater(BaseUpdater):
         self._cl_fisher_accum: dict[str, torch.Tensor] | None = None
         self._cl_steps = 0
 
+    def state_dict(self) -> dict[str, object]:
+        """The prior: anchor and Fisher. Both outlive a CL round."""
+        return {
+            "theta_star": {n: t.detach().cpu() for n, t in self.theta_star.items()},
+            "fisher": {n: t.detach().cpu() for n, t in self.fisher.items()},
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        for key in ("theta_star", "fisher"):
+            saved = state.get(key)
+            if not isinstance(saved, dict):
+                continue
+            target = getattr(self, key)
+            for name, tensor in saved.items():
+                if name in target:
+                    target[name] = tensor.to(self.device)
+
     @torch.no_grad()
     def cl_preprocessing(self) -> None:
         """Called once before the CL loop starts."""

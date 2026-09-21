@@ -209,6 +209,10 @@ class ExperimentCfg:
     # under <path>. Anything else already in the directory is left alone.
     name: str = ""
     run_name: str = ""  # optional label appended to the allocated directory name
+    # Save restart state every N batches of the monitoring loop. 0 saves only
+    # when the job is signalled to stop, which is enough to survive a walltime
+    # limit but not an abrupt kill.
+    restart_interval: int = 0
 
 
 @dataclass(frozen=True)
@@ -242,7 +246,14 @@ def parse_args(argv=None):
         The parsed command line arguments.
     """
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config", type=Path)
+    source.add_argument(
+        "--continue-from",
+        type=Path,
+        dest="continue_from",
+        help="Run directory to resume; its config.resolved.json is used as-is",
+    )
     p.add_argument("--set", action="append", default=[], help="key=val, repeatable")
     p.add_argument(
         "--device",
@@ -257,6 +268,27 @@ def parse_args(argv=None):
     )
 
     return p.parse_args(argv)
+
+
+def config_from_dict(d: Mapping[str, Any]) -> Config:
+    """Rebuild a Config from a resolved-config dict.
+
+    The inverse of ``asdict(cfg)``, used to resume a run without needing the
+    original command line.
+    """
+    return Config(
+        model=ModelCfg(**d["model"]),
+        data=DataCfg(**d["data"]),
+        train=TrainCfg(**d["train"]),
+        continual_learning=ContinualLearningCfg(**d["continual_learning"]),
+        drift_detection=DriftDetectionCfg(**d["drift_detection"]),
+        logging=LoggingCfg(**d["logging"]) if d.get("logging") else None,
+        experiment=ExperimentCfg(**d["experiment"]) if d.get("experiment") else None,
+        seed=d["seed"],
+        device=d["device"],
+        multi_gpu=d.get("multi_gpu", False),
+        verbosity=d.get("verbosity", "INFO"),
+    )
 
 
 def load_toml(p: Path) -> dict[str, Any]:
@@ -368,6 +400,13 @@ def build_config(argv=None) -> Config:
         The final configuration.
     """
     args = parse_args(argv)
+
+    if getattr(args, "continue_from", None) is not None:
+        # Resuming: the run already decided what it is. Overrides are not
+        # applied, since changing the config mid-run is not a resume.
+        resolved = Path(args.continue_from) / "config.resolved.json"
+        return config_from_dict(json.loads(resolved.read_text()))
+
     cfg = load_toml(args.config)
     cfg = deep_update(cfg, env_overrides("APP_"))
     cfg = deep_update(cfg, kv_to_nested(args.set))

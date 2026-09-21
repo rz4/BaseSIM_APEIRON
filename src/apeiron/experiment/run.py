@@ -13,6 +13,7 @@ together. Anything else already in that directory is left alone::
       log.txt               console output
       signature.txt         hash of the journal, written when the run ends
       checkpoints/          existing save_ckpt output, pointed here
+      restart/              state for resuming, removed when the run completes
 
 Existing apeiron code is not told about any of this: :meth:`Run.bind` rewrites
 the output paths in the config, so the logger and the harness write into the
@@ -36,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 from apeiron.config.configuration import Config
 from apeiron.experiment.journal import Journal
 from apeiron.experiment.model_info import describe_model, summarize
+from apeiron.experiment.restart import RestartStore
 
 if TYPE_CHECKING:
     from apeiron.model.torch_model_harness import BaseModelHarness
@@ -84,6 +86,7 @@ class Run:
     def __init__(self, run_dir: str | Path):
         self.run_dir = Path(run_dir)
         self.journal = Journal(self.run_dir / "journal.sqlite")
+        self.restart = RestartStore(self.restart_dir)
         self._started = time.monotonic()
 
     # -- allocation ---------------------------------------------------------
@@ -126,6 +129,22 @@ class Run:
         )
         return run
 
+    @classmethod
+    def open(cls, run_dir: str | Path) -> Run:
+        """Reopen an existing run directory to continue it."""
+        path = Path(run_dir).expanduser()
+        if not (path / "config.resolved.json").is_file():
+            raise FileNotFoundError(f"{path} is not a run directory")
+        return cls(path)
+
+    def resolved_config(self) -> Config:
+        """The config this run was started with."""
+        from apeiron.config.configuration import config_from_dict
+
+        return config_from_dict(
+            json.loads((self.run_dir / "config.resolved.json").read_text())
+        )
+
     # -- layout -------------------------------------------------------------
     @property
     def name(self) -> str:
@@ -134,6 +153,10 @@ class Run:
     @property
     def checkpoints_dir(self) -> Path:
         return self.run_dir / "checkpoints"
+
+    @property
+    def restart_dir(self) -> Path:
+        return self.run_dir / "restart"
 
     @property
     def log_path(self) -> Path:
@@ -189,11 +212,32 @@ class Run:
         self.record("model", **summarize(description))
         return description
 
+    def save_restart(self, state: dict[str, Any], reason: str = "interval") -> Path:
+        """Write restart state and note it in the log."""
+        path = self.restart.save(state)
+        self.record(
+            "restart_saved",
+            reason=reason,
+            batch=state.get("batch_count"),
+            name=path.name,
+        )
+        return path
+
+    def load_restart(self) -> dict[str, Any] | None:
+        """Newest restart state in this run, or None."""
+        return self.restart.load_latest()
+
     def finish(self, status: str = "finished") -> str:
-        """Close the run: record how it ended and write ``signature.txt``."""
+        """Close the run: record how it ended and write ``signature.txt``.
+
+        A completed run has nothing to resume from, so its restart state is
+        removed; a failed or interrupted one keeps it.
+        """
         self.record(
             "run_finished", status=status, elapsed_s=time.monotonic() - self._started
         )
+        if status == "finished":
+            shutil.rmtree(self.restart_dir, ignore_errors=True)
         signature = self.journal.signature()
         self.signature_path.write_text(signature + "\n")
         self.journal.close()

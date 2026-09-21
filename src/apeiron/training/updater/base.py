@@ -28,6 +28,19 @@ class BaseUpdater:
         self.model: nn.Module = modelHarness.model
         self.mix_historic_data: bool = cfg.continual_learning.mix_historic_data
 
+    def state_dict(self) -> dict[str, object]:
+        """Memory this updater carries between drift events.
+
+        Only what survives a CL round belongs here; per-round accumulators are
+        rebuilt by ``cl_preprocessing`` when the round replays. The base
+        updater carries nothing.
+        """
+        return {}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore what :meth:`state_dict` saved."""
+        return None
+
     def fwd_bwd(
         self,
         batch: tuple[torch.Tensor, torch.Tensor],

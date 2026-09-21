@@ -30,7 +30,17 @@ CREATE INDEX IF NOT EXISTS events_kind ON events (kind);
 # Event kinds that describe the process rather than the computation: their
 # payloads are wall-clock times, host names and absolute paths, all of which
 # differ between two runs that did exactly the same work.
-VOLATILE_KINDS = frozenset({"run_started", "run_finished"})
+VOLATILE_KINDS = frozenset(
+    {
+        "run_started",
+        "run_finished",
+        # Interruptions are an accident of when a job was killed, not of what
+        # it computed: a resumed run must compare equal to one that ran through.
+        "run_interrupted",
+        "run_continued",
+        "restart_saved",
+    }
+)
 
 # Payload keys with the same problem, on otherwise comparable events.
 VOLATILE_KEYS = frozenset(
@@ -105,6 +115,22 @@ class Journal:
         return (
             None if row is None else Event(row[0], row[1], row[2], json.loads(row[3]))
         )
+
+    def last_id(self) -> int:
+        """Id of the most recent event, or 0 if the log is empty."""
+        row = self._db.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()
+        return int(row[0])
+
+    def truncate_after(self, event_id: int) -> int:
+        """Drop every event newer than ``event_id`` and return how many.
+
+        Events are committed as they happen, so they run ahead of a restart
+        file written every N batches. On resume the tail has to go, or replaying
+        those batches records them a second time.
+        """
+        with self._lock:
+            cur = self._db.execute("DELETE FROM events WHERE id > ?", (event_id,))
+        return int(cur.rowcount or 0)
 
     def signature(self) -> str:
         """Content hash of what the run did.

@@ -35,6 +35,25 @@ class ContinuousTrainer:
 
         self.cl_updater = create_updater(cfg=self.cfg, modelHarness=self.modelHarness)
 
+    def state_dict(self) -> dict[str, Any]:
+        """Training state that has to survive a restart.
+
+        A CL round is replayed from its start on resume, so nothing from inside
+        a round is here -- only the optimizer and whatever memory the updater
+        carries between drift events.
+        """
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "updater": self.cl_updater.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore what :meth:`state_dict` saved."""
+        if "optimizer" in state:
+            self.optimizer.load_state_dict(state["optimizer"])
+        if "updater" in state:
+            self.cl_updater.load_state_dict(state["updater"])
+
     def _safe_next(
         self,
         current_iter: Iterator,

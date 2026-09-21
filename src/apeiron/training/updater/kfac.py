@@ -53,6 +53,23 @@ class OnlineKFACUpdater(BaseUpdater):
     # Initialization
     # ------------------------------------------------------------------
 
+    def state_dict(self) -> dict[str, object]:
+        """The prior: anchor and the Kronecker factors. All outlive a round."""
+        return {
+            key: {n: t.detach().cpu() for n, t in getattr(self, key).items()}
+            for key in ("theta_star", "A", "G")
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        for key in ("theta_star", "A", "G"):
+            saved = state.get(key)
+            if not isinstance(saved, dict):
+                continue
+            target = getattr(self, key)
+            for name, tensor in saved.items():
+                if name in target:
+                    target[name] = tensor.to(self.device)
+
     def _init_prior(self):
         for name, module in self.model.named_modules():
             if self._supported(module):

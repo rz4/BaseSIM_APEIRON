@@ -15,6 +15,7 @@ The section on its own is enough; every key has a default.
 path = "output"          # where experiments live
 name = "mnist_drift"     # this experiment; runs land in <path>/<name>/
 run_name = ""            # optional label appended to a run's directory name
+restart_interval = 0     # save restart state every N batches; 0 = only on signal
 ```
 
 `path` is relative to the working directory, so on a shared machine set it to
@@ -35,6 +36,7 @@ output/
       log.txt                console output
       signature.txt          hash of the journal, written when the run ends
       checkpoints/           model checkpoints (max_ckpts / ckpts_path)
+      restart/               state for resuming; removed when the run completes
     run_0002/
       ...
   cifar_drift/
@@ -105,6 +107,9 @@ up to the moment it died.
 |---|---|---|
 | `run_started` | `run_dir`, `config_sha256`, `hostname`, `pid` | run directory allocated |
 | `model` | the model record, without the `tensors` table | harness built |
+| `restart_saved` | `reason`, `batch`, `name` | restart state written |
+| `run_continued` | `batch` | resumed with `--continue-from` |
+| `run_interrupted` | `batch` | stopped on signal with state saved |
 | `window` | `index` | after each `update_data_stream()` |
 | `drift_check` | `window`, `batch`, `value`, `detected`, `score` | every drift check, including negative ones |
 | `drift` | `event`, `window`, `batch`, `score`, `regime` | drift detected, before training starts |
@@ -135,14 +140,86 @@ j = Journal("output/mnist_drift/run_0001/journal.sqlite")
 print(j.count("drift_check"), "checks,", j.count("drift"), "drift events")
 ```
 
+## Continuing a killed run
+
+Jobs get killed: walltime limits, node failures, a laptop closing. A run saves
+everything needed to carry on into `restart/`, and
+
+```bash
+poetry run python -m src.main --continue-from output/mnist_drift/run_0001
+```
+
+picks up from the newest saved state. `--continue-from` reads that run's
+`config.resolved.json`, so no other arguments are needed -- and `--set`
+overrides are deliberately not applied, since changing the config mid-run is
+not a resume.
+
+### When state is saved
+
+At batch boundaries in the monitoring loop, either every `restart_interval`
+batches or when the process is signalled. **Never inside a training round**: a
+round is treated as one unit, so a run killed during training replays that
+round from its start. The cost is bounded by one round; the benefit is that
+training needs no resume logic at all.
+
+With `restart_interval = 0` state is saved only on a signal, which survives a
+walltime kill but not an abrupt one. Set an interval to survive both.
+
+### Stopping on a signal
+
+`SIGUSR1` and `SIGTERM` ask the run to save at the next batch boundary and exit
+0. Under Slurm that is:
+
+```bash
+#SBATCH --signal=USR1@300
+```
+
+which delivers the signal five minutes before the walltime kill, leaving time
+to write state and exit cleanly. The run records `run_interrupted` and finishes
+with status `interrupted`.
+
+### What is saved
+
+Model weights, optimizer state, every random generator, the drift detector, the
+updater's memory across drift events (EWC's Fisher and anchor, KFAC's factors),
+the loop's counters including the partially filled metric buffer, and the
+position in the event log.
+
+Per-round accumulators are not saved, because the round replays.
+
+### Correctness
+
+Two things are checked before a state is loaded, because both fail later and
+less clearly otherwise: the config hash, and the model's shape hash. Resuming
+into a differently shaped model -- the harness source changed underneath -- is
+refused with a message saying so.
+
+The event log is committed per event, so it runs ahead of state written every N
+batches. On resume the events past the saved point are dropped and the replayed
+batches re-create them. Without this, a resumed run would double-count.
+
+A completed run has nothing to resume from, so `restart/` is deleted when it
+finishes. A failed or interrupted run keeps it.
+
+### The bar
+
+A run interrupted and resumed produces **the same signature** as a run that was
+never interrupted. That is what the tests assert, and it is checkable by hand:
+
+```bash
+diff output/mnist_drift/run_0001/signature.txt \
+     output/mnist_drift/run_0002/signature.txt
+```
+
 ## Comparing runs
 
 `signature.txt` is a hash of the event log with the volatile parts removed:
 timestamps, host names, process ids and absolute paths are excluded, as are
 the `run_started` and `run_finished` events. What remains is what the run did.
 
-Two runs of the same config should produce the same signature, so a rerun can
-be checked without reading any metrics:
+Two runs of the same config should produce the same signature -- the seed is
+applied for real in experiment mode, which it is not in legacy mode -- so a
+rerun can be checked without reading any metrics:
 
 ```bash
 diff output/mnist_drift/run_0001/signature.txt \

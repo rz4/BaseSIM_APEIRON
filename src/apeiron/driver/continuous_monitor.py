@@ -17,6 +17,10 @@ import numpy as np
 
 from apeiron.config.configuration import Config
 from apeiron.drift_detection.load_drift_detector import load_drift_detector
+from apeiron.experiment.determinism import rng_state, set_rng_state
+from apeiron.experiment.model_info import shapes_hash, tensor_table, unwrap
+from apeiron.experiment.restart import SCHEMA_VERSION, RunInterrupted
+from apeiron.experiment.run import behavior_hash
 from apeiron.drift_detection.detectors.base import DriftSignal
 from apeiron.profilers import FLOPSProfiler
 from apeiron.logger import get_logger
@@ -95,6 +99,16 @@ class ContinuousMonitor:
         # Metrics accumulation
         self.metric_buffer: list[list[float]] = []
 
+        # Restart bookkeeping. All inert without a run directory.
+        self.restart_interval = cfg.experiment.restart_interval if cfg.experiment else 0
+        self._interrupt = False
+        self._resuming = False
+        self._batches_in_pass = 0  # batches taken from the current window's loader
+        self._window_rng: dict | None = None  # rng as it was when that loader was made
+        self._resume_skip = 0
+        self._resume_rng: dict | None = None
+        self._resume_window_rng: dict | None = None
+
         self.logger.info("==== ContinuousMonitor initialized ====", level=0)
         self.logger.info(f"\tDetector: {cfg.drift_detection.detector_name}", level=1)
         self.logger.info(f"\tMonitoring metric index: {self.metric_idx}", level=1)
@@ -103,6 +117,99 @@ class ContinuousMonitor:
         )
         self.logger.info(f"\tAggregation method: {self.aggregation}", level=1)
         self.logger.info(f"\tMax stream updates: {self.max_stream_updates}", level=1)
+
+    def request_interrupt(self) -> None:
+        """Ask the loop to save and stop at the next batch boundary.
+
+        Called from a signal handler, so it does nothing but set a flag.
+        """
+        self._interrupt = True
+
+    def capture_state(self) -> dict:
+        """Everything needed to carry on from this batch boundary."""
+        model = unwrap(self.modelHarness.model)
+        return {
+            "schema": SCHEMA_VERSION,
+            "config_sha256": behavior_hash(self.cfg),
+            "shapes_sha256": shapes_hash(tensor_table(model)),
+            "journal_last_id": (
+                self._run.journal.last_id() if self._run is not None else 0
+            ),
+            "batch_count": self.batch_count,
+            "stream_update_count": self.stream_update_count,
+            "drift_event_count": self.drift_event_count,
+            "batches_in_pass": self._batches_in_pass,
+            "metric_buffer": [list(m) for m in self.metric_buffer],
+            "model": model.state_dict(),
+            "trainer": self.trainer.state_dict(),
+            "detector": self.detector,
+            "rng": rng_state(),
+            "window_rng": self._window_rng,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """Put the loop back where a saved state left it.
+
+        Refuses states from a different config or a differently shaped model,
+        both of which would otherwise fail later and less clearly.
+        """
+        if state.get("schema") != SCHEMA_VERSION:
+            raise ValueError(
+                f"restart state schema {state.get('schema')} != {SCHEMA_VERSION}"
+            )
+
+        model = unwrap(self.modelHarness.model)
+        expected = shapes_hash(tensor_table(model))
+        if state.get("shapes_sha256") != expected:
+            raise ValueError(
+                "restart state was written for a differently shaped model; "
+                "the harness that built it is not the one running now"
+            )
+        if state.get("config_sha256") != behavior_hash(self.cfg):
+            raise ValueError("restart state was written under a different config")
+
+        model.load_state_dict(state["model"])
+        self.trainer.load_state_dict(state["trainer"])
+        self.detector = state["detector"]
+
+        self.batch_count = state["batch_count"]
+        self.stream_update_count = state["stream_update_count"]
+        self.drift_event_count = state["drift_event_count"]
+        self.metric_buffer = [list(m) for m in state["metric_buffer"]]
+
+        # The log is committed per event and so runs ahead of a restart file
+        # written every N batches. Drop the tail; replaying re-creates it.
+        if self._run is not None:
+            dropped = self._run.journal.truncate_after(int(state["journal_last_id"]))
+            if dropped:
+                self.logger.info(
+                    f"\tRolled back {dropped} journal event(s) past the restart point",
+                    level=1,
+                )
+
+        self._resuming = True
+        self._resume_skip = int(state["batches_in_pass"])
+        self._resume_rng = state["rng"]
+        self._resume_window_rng = state["window_rng"]
+
+    def _save_restart(self, reason: str) -> None:
+        if self._run is not None:
+            self._run.save_restart(self.capture_state(), reason=reason)
+
+    def _tick_restart(self) -> None:
+        """Called at every batch boundary."""
+        if self._run is None:
+            return
+        if self._interrupt:
+            self._save_restart("interrupt")
+            self._run.record("run_interrupted", batch=self.batch_count)
+            self.logger.info(
+                f"==== Interrupted at batch {self.batch_count}; state saved ====",
+                level=0,
+            )
+            raise RunInterrupted()
+        if self.restart_interval > 0 and self.batch_count % self.restart_interval == 0:
+            self._save_restart("interval")
 
     def _record(self, kind: str, **payload: object) -> None:
         """Append an event to the run's log. No-op without a run directory."""
@@ -121,7 +228,18 @@ class ContinuousMonitor:
         # Initialize first data stream
         self.logger.info("\tInitializing first data stream...", level=1)
         self.modelHarness.update_data_stream()
-        self._record("window", index=self.stream_update_count)
+        if self._resuming:
+            # Windows are produced in order, so getting back to window N means
+            # asking for N more. Their events are already in the log.
+            for _ in range(self.stream_update_count):
+                self.modelHarness.update_data_stream()
+            self.logger.info(
+                f"\tResumed at window {self.stream_update_count}, "
+                f"batch {self.batch_count}",
+                level=1,
+            )
+        else:
+            self._record("window", index=self.stream_update_count)
 
         while not self._should_stop():
             try:
@@ -144,10 +262,35 @@ class ContinuousMonitor:
         Raises:
             StopIteration: When the data loader is exhausted
         """
+        # A shuffling loader seeds itself from the global generator when its
+        # iterator is made. Recording that generator state, and putting it back
+        # before rebuilding the loader on resume, is what makes the resumed
+        # pass see the same batches in the same order.
+        if self._resume_window_rng is not None:
+            set_rng_state(self._resume_window_rng)
+            self._window_rng = self._resume_window_rng
+            self._resume_window_rng = None
+        else:
+            self._window_rng = rng_state()
+
         val_loader = self.modelHarness.get_stream_dataloader()
+        self._batches_in_pass = 0
+
+        batches = enumerate(val_loader)
+        if self._resume_skip:
+            skip, self._resume_skip = self._resume_skip, 0
+            for _ in range(skip):
+                if next(batches, None) is None:
+                    break
+            self._batches_in_pass = skip
+            if self._resume_rng is not None:
+                # Forward progress continues from the generator state the run
+                # had when it was saved, not from where replaying left it.
+                set_rng_state(self._resume_rng)
+                self._resume_rng = None
 
         for batch_idx, batch in tqdm(
-            enumerate(val_loader),
+            batches,
             desc="Processing batches",
             leave=False,
         ):
@@ -155,6 +298,7 @@ class ContinuousMonitor:
             metrics = self._evaluate_batch(batch)
             self.metric_buffer.append(metrics)
             self.batch_count += 1
+            self._batches_in_pass += 1
 
             # Check drift at specified interval
             if (
@@ -165,6 +309,8 @@ class ContinuousMonitor:
 
                 if drift_signal.drift_detected:
                     self._handle_drift(drift_signal)
+
+            self._tick_restart()
 
         raise StopIteration()
 
