@@ -17,6 +17,12 @@ out to the network, staging the directory ahead of time is the whole story::
 Files are written to a neighbouring ``.part`` name and renamed into place, so a
 file that exists is a file that finished. Nothing removes anything: the copy is
 kept and reused, which is what makes the second run fast.
+
+A third kind of file is *derived*: produced from the ones that were fetched,
+the way a memory-mappable array has to be converted out of HDF5. Those are
+built once on the same terms, and carry a ``.origin`` marker naming the recipe
+that made them, so a conversion that has since changed is rebuilt rather than
+silently reused.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping, Union
 
 from apeiron.config.configuration import Config
 
@@ -36,13 +42,40 @@ TIMEOUT_S = 60.0
 CHUNK = 1 << 20
 
 
+# Marks a derived file with the recipe that produced it, so a conversion that
+# has since changed is rebuilt instead of being used silently.
+ORIGIN_SUFFIX = ".origin"
+
+
+@dataclass(frozen=True)
+class Derived:
+    """A file the run produces rather than fetches.
+
+    ``build`` writes the artifact to the path it is given. ``recipe`` is a
+    string identifying how it was made: anything that would change the bytes --
+    a format version, a dtype, which fields were kept -- belongs in it. A file
+    whose recorded recipe does not match is rebuilt, which is the difference
+    between a cache and a trap.
+
+    Derived files are built after everything fetched, so a conversion can read
+    the sources declared alongside it.
+    """
+
+    build: Callable[[Path], None]
+    recipe: str
+
+
+Input = Union[str, Derived]
+
+
 @dataclass(frozen=True)
 class EnsureResult:
     """What one call to :meth:`DatasetStore.ensure` had to do."""
 
     wanted: int = 0
-    present: int = 0  # already on disk, nothing moved
+    present: int = 0  # already on disk and current, nothing moved
     fetched: int = 0
+    built: int = 0
     bytes_fetched: int = 0
     seconds: float = 0.0
 
@@ -51,6 +84,7 @@ class EnsureResult:
             "wanted": self.wanted,
             "present": self.present,
             "fetched": self.fetched,
+            "built": self.built,
             "bytes_fetched": self.bytes_fetched,
             "seconds": round(self.seconds, 3),
         }
@@ -136,33 +170,88 @@ class DatasetStore:
             raise ValueError(f"dataset name must be a relative path: {name!r}")
         return self.root / relative
 
-    def ensure(self, inputs: Mapping[str, str]) -> EnsureResult:
-        """Make sure every declared file is present, fetching what is missing."""
-        started = time.monotonic()
-        present = fetched = moved = 0
+    def _partial(self, target: Path) -> Path:
+        """A name beside the target, so replace() is a rename and not a copy.
 
-        for name, source in sorted(inputs.items()):
+        The pid keeps two processes working on the same file out of each
+        other's way; both land a complete file and the last one wins.
+        """
+        return target.with_name(f"{target.name}.part.{os.getpid()}")
+
+    def is_current(self, name: str, recipe: str) -> bool:
+        """Whether a derived file exists and was made the way we now ask for."""
+        target = self.path_for(name)
+        origin = self.path_for(name + ORIGIN_SUFFIX)
+        if not target.exists() or not origin.exists():
+            return False
+        return origin.read_text().strip() == recipe
+
+    def derive(self, name: str, spec: Derived) -> int:
+        """Build a derived file unless a current one is already there.
+
+        The recipe marker is renamed into place before the artifact, so a file
+        that exists always has a matching marker beside it. A build killed
+        halfway leaves a stale marker and no artifact, and the next run rebuilds.
+        """
+        if self.is_current(name, spec.recipe):
+            return 0
+
+        target = self.path_for(name)
+        origin = self.path_for(name + ORIGIN_SUFFIX)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        partial_target = self._partial(target)
+        partial_origin = self._partial(origin)
+        try:
+            partial_origin.write_text(spec.recipe + "\n")
+            spec.build(partial_target)
+            if not partial_target.exists():
+                raise OSError(f"build for {name!r} produced no file")
+            partial_origin.replace(origin)
+            partial_target.replace(target)
+        finally:
+            partial_target.unlink(missing_ok=True)
+            partial_origin.unlink(missing_ok=True)
+        return 1
+
+    def ensure(self, inputs: Mapping[str, Input]) -> EnsureResult:
+        """Make every declared file present: fetch what is missing, then build.
+
+        Fetching comes first so that a derived file can read the sources
+        declared beside it.
+        """
+        started = time.monotonic()
+        present = fetched = built = moved = 0
+
+        sources = {n: s for n, s in inputs.items() if not isinstance(s, Derived)}
+        derived = {n: s for n, s in inputs.items() if isinstance(s, Derived)}
+
+        for name, source in sorted(sources.items()):
             target = self.path_for(name)
             if target.exists():
                 present += 1
                 continue
 
             target.parent.mkdir(parents=True, exist_ok=True)
-            # Same directory as the target, so replace() is a rename. Two
-            # processes fetching the same file use different names and both
-            # land a complete file.
-            partial = target.with_name(f"{target.name}.part.{os.getpid()}")
+            partial = self._partial(target)
             try:
-                moved += fetch(source, partial)
+                moved += fetch(str(source), partial)
                 partial.replace(target)
                 fetched += 1
             finally:
                 partial.unlink(missing_ok=True)
 
+        for name, spec in sorted(derived.items()):
+            if self.derive(name, spec):
+                built += 1
+            else:
+                present += 1
+
         return EnsureResult(
             wanted=len(inputs),
             present=present,
             fetched=fetched,
+            built=built,
             bytes_fetched=moved,
             seconds=time.monotonic() - started,
         )

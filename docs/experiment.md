@@ -113,7 +113,7 @@ up to the moment it died.
 | `run_continued` | `batch` | resumed with `--continue-from` |
 | `run_interrupted` | `batch` | stopped on signal with state saved |
 | `window` | `index`, `inputs` | after each `update_data_stream()` |
-| `dataset` | `wanted`, `present`, `fetched`, `bytes_fetched`, `seconds` | window data made ready |
+| `dataset` | `wanted`, `present`, `fetched`, `built`, `bytes_fetched`, `seconds` | window data made ready |
 | `drift_check` | `window`, `batch`, `value`, `detected`, `score` | every drift check, including negative ones |
 | `drift` | `event`, `window`, `batch`, `score`, `regime` | drift detected, before training starts |
 | `checkpoint` | `event`, `name`, `path` | checkpoint written |
@@ -173,6 +173,7 @@ bytes, not the dataset.
 | a local path, or `file://...` | copied in -- an example can ship raw data beside its config |
 | `hf://datasets/owner/repo/path` | downloaded when a window first needs it |
 | `https://...` | the same |
+| a `Derived(...)` | produced from the others, once (see below) |
 
 Both end in the same place with the same layout, so nothing downstream can tell
 which route filled it. `HF_TOKEN` is sent to huggingface.co when set, and to
@@ -183,6 +184,8 @@ nowhere else.
 ```
 output/mnist_drift/datasets/
   train/file_0.hdf5
+  train/file_0.npy                 <- derived, memory-mappable
+  train/file_0.npy.origin          <- the recipe that produced it
   train/file_1.hdf5.part.48213     <- in progress; .part.* is always garbage
 ```
 
@@ -203,6 +206,67 @@ out to the network.
 `datasets_path` defaults to a `datasets` directory beside the experiment's
 runs, so data travels with the experiment. Point it at shared scratch to have
 several experiments share one copy.
+
+### Memory-mapped data
+
+A window that does not fit in memory should be paged in by the operating
+system rather than read through the process. That needs a file whose bytes
+*are* the array, and HDF5 generally is not one -- chunked, often compressed,
+reached through a library. So the mappable file is derived: converted once out
+of what was fetched, then reused forever, on the same terms as a download.
+
+Declare it alongside the source it is built from:
+
+```python
+from apeiron.experiment import Derived, memmap
+
+def window_inputs(self, window: int) -> dict:
+    source = f"train/file_{window}.hdf5"
+    return {
+        source: f"hf://datasets/polymathic-ai/{self.dataset}/data/{source}",
+        f"train/file_{window}.npy": Derived(
+            build=lambda dest: self._convert(source, dest),
+            recipe="hdf5->f32:chw:v1",
+        ),
+    }
+
+def _convert(self, source: str, dest: Path) -> None:
+    with h5py.File(self.datasets.path_for(source)) as h5:
+        frames = h5["t0_fields/density"]
+        with memmap.writing(dest, frames.shape, "float32") as out:
+            for i in range(frames.shape[0]):
+                out[i] = frames[i]          # goes to disk, not to RAM
+```
+
+and read it back as a view:
+
+```python
+frames = memmap.read(self.datasets.path_for(f"train/file_{w}.npy"))
+batch = torch.from_numpy(np.ascontiguousarray(frames[a:b]))
+```
+
+Nothing is read until a page is touched, and only the slice is copied.
+
+Fetched files always land before derived ones are built, so a conversion can
+read the sources declared beside it.
+
+The format is `.npy`, which is not a choice worth making twice: the header is
+self-describing, the array is contiguous after it, numpy maps it with one call,
+and it is a single file, so it lands with the same atomic rename as everything
+else.
+
+**The `recipe` string is the part that matters.** A converted file is only
+valid for the conversion that produced it -- change the dtype, the layout, or
+which fields you keep, and the old file is wrong but still sitting there. The
+recipe is written to a `.origin` marker beside the artifact and compared before
+the file is used; a mismatch rebuilds. Put anything that would change the bytes
+into it. This is the same guard the restart path applies with the model's shape
+hash, for the same reason: silently using the wrong bytes is worse than an
+error.
+
+An artifact with no marker is not trusted either, so a file dropped into the
+store by hand is rebuilt rather than assumed current. That is the one place
+hand-staging does not apply -- stage the sources, not the conversions.
 
 ### What is recorded
 

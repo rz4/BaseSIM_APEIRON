@@ -9,7 +9,9 @@ import pytest
 
 from apeiron.config.configuration import ExperimentCfg
 from apeiron.driver.continuous_monitor import ContinuousMonitor
-from apeiron.experiment import DatasetStore, Run
+import numpy as np
+
+from apeiron.experiment import DatasetStore, Derived, Run, memmap
 from apeiron.experiment.datasets import EnsureResult, hf_url
 
 
@@ -298,4 +300,169 @@ class TestMonitorMaterialises:
         monitor = ContinuousMonitor(cfg=cfg, modelHarness=dummy_harness, run=run)
         monitor._extend_stream()
         assert run.journal.count("dataset") == 0
+        run.finish()
+
+
+# ---------------------------------------------------------------------------
+# derived artifacts and memory mapping
+# ---------------------------------------------------------------------------
+class TestMemmap:
+    def test_write_read_round_trip(self, tmp_path):
+        target = tmp_path / "frames.npy"
+        with memmap.writing(target, (5, 2, 3), "float32") as out:
+            for i in range(5):
+                out[i] = i
+
+        mapped = memmap.read(target)
+        assert isinstance(mapped, np.memmap)
+        assert mapped.shape == (5, 2, 3)
+        assert mapped.dtype == np.float32
+        assert float(mapped[3, 1, 2]) == 3.0
+
+    def test_read_is_a_view_not_a_copy(self, tmp_path):
+        target = tmp_path / "frames.npy"
+        with memmap.writing(target, (4,), "int64") as out:
+            out[:] = [1, 2, 3, 4]
+        mapped = memmap.read(target)
+        assert mapped.flags.writeable is False  # read-only, backed by the file
+        assert mapped.base is not None
+
+    def test_describe_without_reading(self, tmp_path):
+        target = tmp_path / "frames.npy"
+        with memmap.writing(target, (100, 8), "float64") as out:
+            out[0] = 1.0
+        assert memmap.describe(target) == {
+            "shape": [100, 8],
+            "dtype": "float64",
+            "bytes": 100 * 8 * 8,
+        }
+
+    def test_writing_never_holds_the_array(self, tmp_path):
+        """The file is full size before anything is written into it."""
+        target = tmp_path / "frames.npy"
+        with memmap.writing(target, (256, 128), "float32") as out:
+            assert target.stat().st_size >= 256 * 128 * 4
+            out[0] = 1.0
+        assert memmap.read(target).shape == (256, 128)
+
+
+class TestDerived:
+    def _builder(self, calls: list, value: float = 1.0):
+        def build(dest):
+            calls.append(dest)
+            with memmap.writing(dest, (3, 2), "float32") as out:
+                out[:] = value
+
+        return build
+
+    def test_built_once_then_reused(self, tmp_path):
+        store = DatasetStore(tmp_path / "datasets")
+        calls: list = []
+        spec = Derived(build=self._builder(calls), recipe="hdf5->f32:v1")
+
+        first = store.ensure({"train/f.npy": spec})
+        second = store.ensure({"train/f.npy": spec})
+
+        assert (first.built, first.present) == (1, 0)
+        assert (second.built, second.present) == (0, 1)
+        assert len(calls) == 1
+        assert memmap.read(store.path_for("train/f.npy")).shape == (3, 2)
+
+    def test_changed_recipe_rebuilds(self, tmp_path):
+        store = DatasetStore(tmp_path / "datasets")
+        calls: list = []
+        store.ensure({"f.npy": Derived(build=self._builder(calls, 1.0), recipe="v1")})
+        result = store.ensure(
+            {"f.npy": Derived(build=self._builder(calls, 9.0), recipe="v2")}
+        )
+        assert result.built == 1
+        assert len(calls) == 2
+        assert float(memmap.read(store.path_for("f.npy"))[0, 0]) == 9.0
+
+    def test_recipe_marker_sits_beside_the_artifact(self, tmp_path):
+        store = DatasetStore(tmp_path / "datasets")
+        store.ensure({"f.npy": Derived(build=self._builder([]), recipe="v1")})
+        assert store.path_for("f.npy.origin").read_text().strip() == "v1"
+        assert store.is_current("f.npy", "v1")
+        assert not store.is_current("f.npy", "v2")
+
+    def test_artifact_without_a_marker_is_not_trusted(self, tmp_path):
+        """A file put there by other means is rebuilt, not assumed current."""
+        store = DatasetStore(tmp_path / "datasets")
+        stray = store.path_for("f.npy")
+        stray.parent.mkdir(parents=True)
+        stray.write_bytes(b"not a real conversion")
+
+        calls: list = []
+        result = store.ensure(
+            {"f.npy": Derived(build=self._builder(calls), recipe="v1")}
+        )
+        assert result.built == 1 and len(calls) == 1
+
+    def test_a_failed_build_leaves_nothing_usable(self, tmp_path):
+        store = DatasetStore(tmp_path / "datasets")
+
+        def explode(dest):
+            dest.write_bytes(b"half")
+            raise OSError("converter died")
+
+        with pytest.raises(OSError, match="converter died"):
+            store.ensure({"f.npy": Derived(build=explode, recipe="v1")})
+
+        assert not store.path_for("f.npy").exists()
+        assert not store.is_current("f.npy", "v1")
+        assert not list(store.root.glob("*.part.*"))
+
+    def test_a_build_that_writes_nothing_is_an_error(self, tmp_path):
+        store = DatasetStore(tmp_path / "datasets")
+        with pytest.raises(OSError, match="produced no file"):
+            store.ensure({"f.npy": Derived(build=lambda dest: None, recipe="v1")})
+
+    def test_sources_land_before_derived_files_are_built(self, tmp_path):
+        """A conversion must be able to read what was fetched alongside it."""
+        declared = _source_files(tmp_path, **{"raw.bin": b"\x01\x02\x03\x04"})
+        store = DatasetStore(tmp_path / "datasets")
+
+        def convert(dest):
+            raw = store.path_for("raw.bin").read_bytes()
+            with memmap.writing(dest, (len(raw),), "uint8") as out:
+                out[:] = np.frombuffer(raw, dtype="uint8")
+
+        # "derived.npy" sorts before "raw.bin", so ordering cannot be luck
+        result = store.ensure(
+            {
+                "derived.npy": Derived(build=convert, recipe="bin->u8:v1"),
+                **declared,
+            }
+        )
+        assert (result.fetched, result.built) == (1, 1)
+        assert list(memmap.read(store.path_for("derived.npy"))) == [1, 2, 3, 4]
+
+    def test_reported_in_the_window_event(self, default_cfg, dummy_harness, tmp_path):
+        from apeiron.config.configuration import ExperimentCfg
+        from apeiron.driver.continuous_monitor import ContinuousMonitor
+
+        store = DatasetStore(tmp_path / "datasets")
+        dummy_harness.datasets = store
+        spec = Derived(build=self._builder([]), recipe="v1")
+
+        cfg = replace(
+            default_cfg, experiment=ExperimentCfg(path=str(tmp_path), name="e")
+        )
+        run = Run.create(cfg)
+        with patch.object(
+            type(dummy_harness), "window_inputs", lambda self, w: {"f.npy": spec}
+        ):
+            with patch(
+                "apeiron.driver.continuous_monitor.get_logger", return_value=MagicMock()
+            ):
+                monitor = ContinuousMonitor(
+                    cfg=cfg, modelHarness=dummy_harness, run=run
+                )
+                monitor._extend_stream()
+
+        event = run.journal.last("dataset")
+        assert event is not None and event.payload["built"] == 1
+        window = run.journal.last("window")
+        assert window is not None and window.payload["inputs"] == ["f.npy"]
         run.finish()

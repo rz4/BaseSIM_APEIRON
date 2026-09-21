@@ -233,6 +233,11 @@ class BaseModelHarness(ABC):
         framework makes every declared file present before
         :meth:`update_data_stream` is called for that window.
 
+        A source can instead be a ``Derived``, for a file this run produces
+        rather than fetches -- a memory-mappable array converted out of a
+        fetched HDF5, say. Those are built after everything fetched, once, and
+        rebuilt if the recipe that made them changes.
+
         Declaring per window rather than per run is the point: a run that
         touches three regimes of a large dataset should move three regimes'
         worth of bytes.
