@@ -39,6 +39,10 @@ VOLATILE_KINDS = frozenset(
         "run_interrupted",
         "run_continued",
         "restart_saved",
+        # Whether a file had to be fetched or was already on disk is a fact
+        # about this machine, not about what the run computed. Which files a
+        # window used is behaviour, and rides on the window event instead.
+        "dataset",
     }
 )
 

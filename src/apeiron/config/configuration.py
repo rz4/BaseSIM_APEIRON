@@ -209,6 +209,10 @@ class ExperimentCfg:
     # under <path>. Anything else already in the directory is left alone.
     name: str = ""
     run_name: str = ""  # optional label appended to the allocated directory name
+    # Where dataset files are kept. Empty means <path>/<name>/datasets, so the
+    # data travels with the experiment; point it at shared scratch to have
+    # several experiments share one copy.
+    datasets_path: str = ""
     # Save restart state every N batches of the monitoring loop. 0 saves only
     # when the job is signalled to stop, which is enough to survive a walltime
     # limit but not an abrupt kill.

@@ -7,6 +7,7 @@ resumed must produce the same journal signature as one that ran through.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,7 +30,13 @@ from apeiron.config.configuration import (
 )
 from apeiron.driver.continuous_monitor import ContinuousMonitor
 from apeiron.evaluation.metrics import accuracy
-from apeiron.experiment import Journal, Run, RunInterrupted, seed_everything
+from apeiron.experiment import (
+    DatasetStore,
+    Journal,
+    Run,
+    RunInterrupted,
+    seed_everything,
+)
 from apeiron.experiment.determinism import rng_state, set_rng_state
 from apeiron.experiment.restart import KEEP, RestartStore
 from apeiron.model.torch_model_harness import BaseModelHarness
@@ -89,6 +96,15 @@ class DriftingHarness(BaseModelHarness):
         return SGD(self.model.parameters(), lr=self.cfg.train.init_lr)
 
 
+class StagedHarness(DriftingHarness):
+    """Declares a file per window, so the resume path re-materialises them."""
+
+    shipped: Path
+
+    def window_inputs(self, window: int) -> dict[str, str]:
+        return {f"w{window}.bin": str(self.shipped / f"w{window}.bin")}
+
+
 def _cfg(tmp_path, **experiment) -> Config:
     return Config(
         model=ModelCfg(name="tiny", max_ckpts=2, ckpts_path="ignored"),
@@ -117,22 +133,28 @@ def _quiet_logger():
             yield mock
 
 
-def _start(cfg: Config) -> tuple[Run, ContinuousMonitor]:
+def _build(cfg: Config, harness_cls=DriftingHarness) -> DriftingHarness:
+    harness = harness_cls(cfg)
+    harness.datasets = DatasetStore.for_config(cfg)
+    return harness
+
+
+def _start(cfg: Config, harness_cls=DriftingHarness) -> tuple[Run, ContinuousMonitor]:
     """What main() does: allocate, bind, seed, build, monitor."""
     run = Run.create(cfg)
     bound = run.bind(cfg)
     seed_everything(bound.seed)
-    harness = DriftingHarness(bound)
+    harness = _build(bound, harness_cls)
     run.record_model(harness)
     return run, ContinuousMonitor(cfg=bound, modelHarness=harness, run=run)
 
 
-def _reopen(run_dir) -> tuple[Run, ContinuousMonitor]:
+def _reopen(run_dir, harness_cls=DriftingHarness) -> tuple[Run, ContinuousMonitor]:
     """What main() does with --continue-from."""
     run = Run.open(run_dir)
     bound = run.bind(run.resolved_config())
     seed_everything(bound.seed)
-    harness = DriftingHarness(bound)
+    harness = _build(bound, harness_cls)
     monitor = ContinuousMonitor(cfg=bound, modelHarness=harness, run=run)
     state = run.load_restart()
     assert state is not None
@@ -390,6 +412,40 @@ class TestCrashEquivalence:
         # rolled-back events are gone and only the resume marker is new.
         assert [e.kind for e in tail] == ["run_continued"]
         after.close()
+
+    def test_declared_data_does_not_double_count_on_resume(self, tmp_path):
+        """Resuming re-materialises windows already passed. That must not
+        re-record them: the events survived the journal rollback."""
+        shipped = tmp_path / "shipped"
+        shipped.mkdir()
+        for w in range(5):
+            (shipped / f"w{w}.bin").write_bytes(b"data" * (w + 1))
+        StagedHarness.shipped = shipped
+
+        run, monitor = _start(_cfg(tmp_path, name="staged_ref"), StagedHarness)
+        monitor.run()
+        reference = run.finish()
+
+        run, monitor = _start(
+            _cfg(tmp_path, name="staged", restart_interval=4), StagedHarness
+        )
+        _interrupt_at(monitor, 40)
+        with pytest.raises(RunInterrupted):
+            monitor.run()
+        run_dir = run.run_dir
+        run.finish(status="interrupted")
+
+        resumed_run, resumed = _reopen(run_dir, StagedHarness)
+        resumed.run()
+        assert resumed_run.finish() == reference
+
+        # the behavioural part -- which files -- is on the window events
+        log = Journal(run_dir / "journal.sqlite")
+        windows = log.events("window")
+        assert [w.payload["inputs"] for w in windows] == [
+            [f"w{i}.bin"] for i in range(len(windows))
+        ]
+        log.close()
 
     def test_two_interruptions_still_match(self, tmp_path):
         reference = self._reference(tmp_path)

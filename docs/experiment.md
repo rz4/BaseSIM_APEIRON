@@ -16,6 +16,7 @@ path = "output"          # where experiments live
 name = "mnist_drift"     # this experiment; runs land in <path>/<name>/
 run_name = ""            # optional label appended to a run's directory name
 restart_interval = 0     # save restart state every N batches; 0 = only on signal
+datasets_path = ""       # where data is kept; default <path>/<name>/datasets
 ```
 
 `path` is relative to the working directory, so on a shared machine set it to
@@ -27,6 +28,7 @@ experiment together; leaving it empty puts runs directly under `path`.
 ```
 output/
   mnist_drift/
+    datasets/              data this experiment uses, shared by every run
     run_0001/
       config.toml            copy of the config file passed to --config
       config.resolved.json   the config that actually ran, after --set and APP_ overrides
@@ -110,7 +112,8 @@ up to the moment it died.
 | `restart_saved` | `reason`, `batch`, `name` | restart state written |
 | `run_continued` | `batch` | resumed with `--continue-from` |
 | `run_interrupted` | `batch` | stopped on signal with state saved |
-| `window` | `index` | after each `update_data_stream()` |
+| `window` | `index`, `inputs` | after each `update_data_stream()` |
+| `dataset` | `wanted`, `present`, `fetched`, `bytes_fetched`, `seconds` | window data made ready |
 | `drift_check` | `window`, `batch`, `value`, `detected`, `score` | every drift check, including negative ones |
 | `drift` | `event`, `window`, `batch`, `score`, `regime` | drift detected, before training starts |
 | `checkpoint` | `event`, `name`, `path` | checkpoint written |
@@ -139,6 +142,76 @@ from apeiron.experiment import Journal
 j = Journal("output/mnist_drift/run_0001/journal.sqlite")
 print(j.count("drift_check"), "checks,", j.count("drift"), "drift events")
 ```
+
+## Data
+
+A harness can leave its data alone and apeiron will not interfere. A harness
+that declares what each window needs gets it put in place first:
+
+```python
+class WELL_FNO(BaseModelHarness):
+    def window_inputs(self, window: int) -> dict[str, str]:
+        """name in the store -> where to get it"""
+        f = self.files[window]
+        return {f"train/{f}": f"hf://datasets/polymathic-ai/{self.dataset}/data/train/{f}"}
+
+    def update_data_stream(self) -> None:
+        # everything window_inputs declared is on disk by the time this runs
+        path = self.datasets.path_for(f"train/{self.files[self.window]}")
+```
+
+The default returns `{}`, so existing harnesses need no change.
+
+Declaring per window rather than per run is the point. The Well is fifteen
+terabytes; a run that touches three regimes should move three regimes' worth of
+bytes, not the dataset.
+
+### Two routes in
+
+| source | what happens |
+|---|---|
+| a local path, or `file://...` | copied in -- an example can ship raw data beside its config |
+| `hf://datasets/owner/repo/path` | downloaded when a window first needs it |
+| `https://...` | the same |
+
+Both end in the same place with the same layout, so nothing downstream can tell
+which route filled it. `HF_TOKEN` is sent to huggingface.co when set, and to
+nowhere else.
+
+### The store
+
+```
+output/mnist_drift/datasets/
+  train/file_0.hdf5
+  train/file_1.hdf5.part.48213     <- in progress; .part.* is always garbage
+```
+
+Files are written to a neighbouring `.part` name and renamed into place, so a
+file that exists is a file that finished -- there is no index to consult and no
+partial file to mistake for a whole one. Two processes fetching the same file
+use different `.part` names and both land a complete file.
+
+Nothing is ever removed. The copy is kept and reused: the second run of an
+experiment does no I/O at all, and the `dataset` event records the difference.
+
+Because the layout is derived from the names the harness declares and not from
+where the bytes came from, **staging by hand works**. Copy files into the store
+with whatever transfer tool you like and the run finds them already there --
+which is what you want on a machine whose compute nodes should not be reaching
+out to the network.
+
+`datasets_path` defaults to a `datasets` directory beside the experiment's
+runs, so data travels with the experiment. Point it at shared scratch to have
+several experiments share one copy.
+
+### What is recorded
+
+The `window` event carries the names the window declared, so the log says what
+data each window used. The `dataset` event carries the accounting -- how many
+files were already present, how many were fetched, how many bytes, how long --
+and is left out of the signature, because whether a file had to be downloaded
+is a fact about the machine rather than about what the run computed. A cold run
+and a warm run of the same config compare equal.
 
 ## Continuing a killed run
 

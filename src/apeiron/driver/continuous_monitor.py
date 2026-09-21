@@ -108,6 +108,7 @@ class ContinuousMonitor:
         self._resume_skip = 0
         self._resume_rng: dict | None = None
         self._resume_window_rng: dict | None = None
+        self._window_inputs: list[str] = []
 
         self.logger.info("==== ContinuousMonitor initialized ====", level=0)
         self.logger.info(f"\tDetector: {cfg.drift_detection.detector_name}", level=1)
@@ -211,6 +212,22 @@ class ContinuousMonitor:
         if self.restart_interval > 0 and self.batch_count % self.restart_interval == 0:
             self._save_restart("interval")
 
+    def _ensure_window_inputs(self) -> None:
+        """Make the coming window's data present before the harness opens it."""
+        self._window_inputs = sorted(
+            self.modelHarness.window_inputs(self.stream_update_count)
+        )
+        stats = self.modelHarness.ensure_window_inputs(self.stream_update_count)
+        if stats is None:
+            return
+        self.logger.info(
+            f"\tWindow {self.stream_update_count} data: {stats.present} present, "
+            f"{stats.fetched} fetched ({stats.bytes_fetched / 1e6:.1f} MB) "
+            f"in {stats.seconds:.1f}s",
+            level=1,
+        )
+        self._record("dataset", window=self.stream_update_count, **stats.as_payload())
+
     def _record(self, kind: str, **payload: object) -> None:
         """Append an event to the run's log. No-op without a run directory."""
         if self._run is not None:
@@ -227,11 +244,13 @@ class ContinuousMonitor:
 
         # Initialize first data stream
         self.logger.info("\tInitializing first data stream...", level=1)
+        self._ensure_window_inputs()
         self.modelHarness.update_data_stream()
         if self._resuming:
             # Windows are produced in order, so getting back to window N means
             # asking for N more. Their events are already in the log.
             for _ in range(self.stream_update_count):
+                self._ensure_window_inputs()
                 self.modelHarness.update_data_stream()
             self.logger.info(
                 f"\tResumed at window {self.stream_update_count}, "
@@ -239,7 +258,11 @@ class ContinuousMonitor:
                 level=1,
             )
         else:
-            self._record("window", index=self.stream_update_count)
+            self._record(
+                "window",
+                index=self.stream_update_count,
+                inputs=self._window_inputs,
+            )
 
         while not self._should_stop():
             try:
@@ -502,8 +525,11 @@ class ContinuousMonitor:
         )
 
         # Load next data buffer
+        self._ensure_window_inputs()
         self.modelHarness.update_data_stream()
-        self._record("window", index=self.stream_update_count)
+        self._record(
+            "window", index=self.stream_update_count, inputs=self._window_inputs
+        )
 
     def _should_stop(self) -> bool:
         """Check if monitoring should stop.

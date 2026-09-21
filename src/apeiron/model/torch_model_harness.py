@@ -1,7 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional, Callable, Tuple, List, Dict
+from typing import TYPE_CHECKING, Any, Optional, Callable, Tuple, List, Dict
 
 import torch
 from torch import nn, Tensor
@@ -9,6 +9,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import Optimizer
 
 from apeiron.config.configuration import Config
+
+if TYPE_CHECKING:
+    from apeiron.experiment.datasets import DatasetStore, EnsureResult
 
 MetricFn = Callable[[Tensor, Tensor], Any]
 CriterionFn = Callable[[Tensor, Tensor], Tensor]
@@ -33,6 +36,9 @@ class BaseModelHarness(ABC):
         self.model.to(device)
 
         self.eval_metrics: Dict[str, MetricFn] = {}
+
+        # Set by the runner in experiment mode; see window_inputs().
+        self.datasets: DatasetStore | None = None
 
         # One entry per drift event, oldest first: the frozen validation split of
         # the window that was adapted to, paired with R[i][i] (see register_task).
@@ -217,6 +223,36 @@ class BaseModelHarness(ABC):
         Index-aligned with :meth:`eval_past_tasks`.
         """
         return [diagonal for _, diagonal in self._task_records]
+
+    def window_inputs(self, window: int) -> Dict[str, str]:
+        """Files this window needs, as ``name in the store`` -> ``where to get it``.
+
+        The name is a relative path the harness chooses and then reads back
+        through :attr:`datasets`; the source is a local path to copy, an
+        ``hf://datasets/owner/repo/path`` URI, or an ``https://`` URL. The
+        framework makes every declared file present before
+        :meth:`update_data_stream` is called for that window.
+
+        Declaring per window rather than per run is the point: a run that
+        touches three regimes of a large dataset should move three regimes'
+        worth of bytes.
+
+        Returns
+        -------
+        By default, an empty dict: the harness looks after its own data.
+        """
+        return {}
+
+    def ensure_window_inputs(self, window: int) -> EnsureResult | None:
+        """Make this window's declared files present. Returns stats, or None.
+
+        None means there was nothing to do -- no declared inputs, or no store,
+        which is the case outside experiment mode.
+        """
+        wanted = self.window_inputs(window)
+        if not wanted or self.datasets is None:
+            return None
+        return self.datasets.ensure(wanted)
 
     def model_config(self) -> Dict[str, Any]:
         """Return the model's own hyperparameters, if it has any worth keeping.
