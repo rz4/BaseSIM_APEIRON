@@ -6,31 +6,40 @@ did and nothing in this page applies.
 
 ```toml
 [experiment]
-path = "experiments/mnist_drift"   # runs are allocated under <path>/runs/
-run_name = ""                      # optional label appended to the directory name
 ```
+
+The section on its own is enough; both keys have defaults.
+
+```toml
+[experiment]
+path = "output"      # any directory. runs are allocated inside it
+run_name = ""        # optional label appended to the directory name
+```
+
+`path` is relative to the working directory, so on a shared machine set it to
+scratch space rather than relying on the default.
 
 ## Run directory
 
 ```
-experiments/mnist_drift/
-  runs/
-    run_0001/
-      config.toml            copy of the config file passed to --config
-      config.resolved.json   the config that actually ran, after --set and APP_ overrides
-      model.json             what model was used
-      journal.sqlite         event log
-      metrics.csv            the [logging] metrics CSV
-      log.txt                console output
-      signature.txt          hash of the journal, written when the run ends
-      checkpoints/           model checkpoints (max_ckpts / ckpts_path)
-    run_0002/
-      ...
+output/
+  run_0001/
+    config.toml            copy of the config file passed to --config
+    config.resolved.json   the config that actually ran, after --set and APP_ overrides
+    model.json             what model was used
+    journal.sqlite         event log
+    metrics.csv            the [logging] metrics CSV
+    log.txt                console output
+    signature.txt          hash of the journal, written when the run ends
+    checkpoints/           model checkpoints (max_ckpts / ckpts_path)
+  run_0002/
+    ...
 ```
 
-Directories are allocated in order and never reused. Allocation uses an
-exclusive `mkdir`, so several jobs starting at the same moment each get their
-own number rather than colliding.
+Directories are allocated in order and never reused. Anything already in `path`
+that is not named `run_NNNN` is ignored, so pointing at a directory with other
+contents is fine. Allocation uses an exclusive `mkdir`, so several jobs starting
+at the same moment each get their own number rather than colliding.
 
 `[logging] metrics_output_path` and `[model] ckpts_path` are rewritten at
 startup to point inside the run directory; their values in the config file are
@@ -115,7 +124,7 @@ or from Python:
 ```python
 from apeiron.experiment import Journal
 
-j = Journal("experiments/mnist_drift/runs/run_0001/journal.sqlite")
+j = Journal("output/run_0001/journal.sqlite")
 print(j.count("drift_check"), "checks,", j.count("drift"), "drift events")
 ```
 
@@ -129,8 +138,7 @@ Two runs of the same config should produce the same signature, so a rerun can
 be checked without reading any metrics:
 
 ```bash
-diff experiments/mnist_drift/runs/run_0001/signature.txt \
-     experiments/mnist_drift/runs/run_0002/signature.txt
+diff output/run_0001/signature.txt output/run_0002/signature.txt
 ```
 
 A difference means the two runs behaved differently. Note that this is a

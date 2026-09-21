@@ -1,7 +1,8 @@
 """The run directory: one self-contained directory per run.
 
 Everything a run reads that is not data, and everything a run writes, lives
-under ``<experiment path>/runs/run_NNNN``::
+under ``<experiment path>/run_NNNN``. The path is any directory; runs are
+allocated inside it and anything else already there is left alone::
 
     run_0001/
       config.toml           copy of the config file that was passed
@@ -51,10 +52,10 @@ def _safe_name(name: str) -> str:
     return _SAFE_NAME_RE.sub("-", name).strip("-")
 
 
-def _next_index(runs_root: Path) -> int:
+def _next_index(root: Path) -> int:
     used = [
         int(m.group(1))
-        for p in runs_root.iterdir()
+        for p in root.iterdir()
         if p.is_dir() and (m := _RUN_DIR_RE.match(p.name))
     ]
     return max(used, default=0) + 1
@@ -87,14 +88,14 @@ class Run:
         if cfg.experiment is None:
             raise ValueError("Run.create requires an [experiment] section")
 
-        runs_root = Path(cfg.experiment.path).expanduser() / "runs"
-        runs_root.mkdir(parents=True, exist_ok=True)
+        root = Path(cfg.experiment.path).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
 
         suffix = _safe_name(cfg.experiment.run_name)
         suffix = f"_{suffix}" if suffix else ""
 
         for _ in range(MAX_ALLOC_ATTEMPTS):
-            candidate = runs_root / f"run_{_next_index(runs_root):04d}{suffix}"
+            candidate = root / f"run_{_next_index(root):04d}{suffix}"
             try:
                 # Exclusive create: two processes racing for the same number
                 # cannot both win, and the loser simply takes the next one.
@@ -104,7 +105,7 @@ class Run:
             run = cls(candidate)
             break
         else:
-            raise RuntimeError(f"could not allocate a run directory under {runs_root}")
+            raise RuntimeError(f"could not allocate a run directory under {root}")
 
         if config_path is not None:
             shutil.copyfile(config_path, run.run_dir / "config.toml")

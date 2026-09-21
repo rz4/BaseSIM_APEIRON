@@ -196,12 +196,15 @@ class LoggingCfg:
 class ExperimentCfg:
     """Opt-in bounded run directories.
 
-    With this section present, each run gets its own directory under
-    ``<path>/runs/`` holding its config, event log, metrics, log and
-    checkpoints. Without it, apeiron writes where it always did.
+    With this section present -- even empty -- each run gets its own directory
+    under ``path`` holding its config, event log, metrics, log and checkpoints.
+    Without it, apeiron writes where it always did.
     """
 
-    path: str  # experiment directory; runs are allocated under <path>/runs/
+    # Any directory. Runs are allocated inside it as run_0001, run_0002, ...;
+    # anything else already there is left alone. Set this to scratch space on a
+    # shared machine, where the working directory is usually the wrong disk.
+    path: str = "output"
     run_name: str = ""  # optional label appended to the allocated directory name
 
 

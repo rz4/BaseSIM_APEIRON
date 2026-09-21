@@ -146,12 +146,12 @@ class TestRunLayout:
         second = Run.create(cfg)
         assert first.name == "run_0001"
         assert second.name == "run_0002"
-        assert first.run_dir.parent == tmp_path / "runs"
+        assert first.run_dir.parent == tmp_path
         first.finish()
         second.finish()
 
     def test_skips_existing_numbers(self, default_cfg, tmp_path):
-        (tmp_path / "runs" / "run_0007_old").mkdir(parents=True)
+        (tmp_path / "run_0007_old").mkdir(parents=True)
         run = Run.create(_exp_cfg(default_cfg, tmp_path))
         assert run.name == "run_0008"
         run.finish()
@@ -166,6 +166,14 @@ class TestRunLayout:
         src.write_text('[model]\nname = "tiny"\n')
         run = Run.create(_exp_cfg(default_cfg, tmp_path), config_path=src)
         assert (run.run_dir / "config.toml").read_text() == src.read_text()
+        run.finish()
+
+    def test_ignores_unrelated_contents(self, default_cfg, tmp_path):
+        (tmp_path / "mnist.csv").write_text("x")
+        (tmp_path / "some_dir").mkdir()
+        run = Run.create(_exp_cfg(default_cfg, tmp_path))
+        assert run.name == "run_0001"
+        assert (tmp_path / "mnist.csv").exists()
         run.finish()
 
     def test_requires_experiment_section(self, default_cfg):
@@ -284,6 +292,15 @@ class TestConfigSection:
         assert cfg.experiment is None
         # legacy: resolved config still lands in the working directory
         assert (tmp_path / "resolved_config.json").exists()
+
+    def test_empty_section_is_enough(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        toml = tmp_path / "c.toml"
+        toml.write_text(MINIMAL_TOML + "\n[experiment]\n")
+        cfg = build_config(["--config", str(toml)])
+        assert cfg.experiment is not None
+        assert cfg.experiment.path == "output"
+        assert cfg.experiment.run_name == ""
 
     def test_present_section_parsed(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
