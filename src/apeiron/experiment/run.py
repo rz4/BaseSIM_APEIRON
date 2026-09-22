@@ -25,9 +25,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -66,6 +69,59 @@ def _next_index(root: Path) -> int:
         if p.is_dir() and (m := _RUN_DIR_RE.match(p.name))
     ]
     return max(used, default=0) + 1
+
+
+def _git_revision() -> dict[str, str | bool] | None:
+    """The working tree's commit and whether it was clean, if this is a repo.
+
+    A config says what was asked for; it cannot say which version of the code
+    answered. Never raises: not being in a repository is normal.
+    """
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if commit.returncode != 0:
+            return None
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {"commit": commit.stdout.strip(), "dirty": bool(status.stdout.strip())}
+
+
+def environment() -> dict[str, object]:
+    """What software produced this run.
+
+    Recorded on run_started, which is left out of the signature: a torch
+    upgrade is worth knowing about but is not a behavioural difference the
+    framework can judge.
+    """
+    import torch
+
+    facts: dict[str, object] = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "platform": platform.platform(),
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "argv": sys.argv[1:],
+    }
+    if torch.cuda.is_available():
+        facts["cuda"] = torch.version.cuda
+        facts["gpu"] = torch.cuda.get_device_name(0)
+    if (revision := _git_revision()) is not None:
+        facts["git"] = revision
+    return facts
 
 
 def behavior_hash(cfg: Config) -> str:
@@ -124,8 +180,7 @@ class Run:
             "run_started",
             run_dir=str(run.run_dir),
             config_sha256=behavior_hash(cfg),
-            hostname=socket.gethostname(),
-            pid=os.getpid(),
+            **environment(),
         )
         return run
 

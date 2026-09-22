@@ -544,3 +544,82 @@ class TestRecordModel:
             run.record("window", index=0)
             sigs.append(run.finish())
         assert sigs[0] == sigs[1]
+
+
+# ---------------------------------------------------------------------------
+# provenance and naming
+# ---------------------------------------------------------------------------
+class TestEnvironment:
+    def test_records_what_software_ran(self, default_cfg, tmp_path):
+        run = Run.create(_exp_cfg(default_cfg, tmp_path))
+        started = run.journal.last("run_started")
+        assert started is not None
+        for key in ("python", "torch", "platform", "hostname", "pid"):
+            assert key in started.payload
+        run.finish()
+
+    def test_git_revision_when_in_a_repository(self):
+        from apeiron.experiment.run import environment
+
+        facts = environment()
+        # this repository is one, so the fields should be there and sane
+        assert set(facts["git"]) == {"commit", "dirty"}
+        assert len(facts["git"]["commit"]) == 40
+
+    def test_git_absent_outside_a_repository(self, monkeypatch):
+        from apeiron.experiment import run as run_module
+
+        monkeypatch.setattr(run_module.subprocess, "run", _failing_git)
+        assert "git" not in run_module.environment()
+
+    def test_provenance_stays_out_of_the_signature(self, default_cfg, tmp_path):
+        """A torch upgrade is worth knowing about; it is not new behaviour."""
+        cfg = _exp_cfg(default_cfg, tmp_path)
+        first = Run.create(cfg)
+        first.record("window", index=0)
+        a = first.finish()
+
+        second = Run.create(cfg)
+        second.record("run_started", python="9.9", torch="99.0", git={"dirty": True})
+        second.record("window", index=0)
+        assert second.finish() == a
+
+
+def _failing_git(*args, **kwargs):
+    raise OSError("git not found")
+
+
+class TestExperimentNameFallback:
+    def _toml(self, tmp_path, body: str) -> Path:
+        path = tmp_path / "c.toml"
+        path.write_text(MINIMAL_TOML + body)
+        return path
+
+    def test_falls_back_to_the_logging_project(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        toml = self._toml(
+            tmp_path,
+            '\n[logging]\nbackend = "none"\nexperiment_name = "mnist-drift"\n'
+            "\n[experiment]\n",
+        )
+        cfg = build_config(["--config", str(toml)])
+        assert cfg.experiment is not None
+        assert cfg.experiment.name == "mnist-drift"
+
+    def test_an_explicit_name_wins(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        toml = self._toml(
+            tmp_path,
+            '\n[logging]\nbackend = "none"\nexperiment_name = "tracked-as"\n'
+            '\n[experiment]\nname = "stored-as"\n',
+        )
+        cfg = build_config(["--config", str(toml)])
+        assert cfg.experiment is not None
+        assert cfg.experiment.name == "stored-as"
+
+    def test_neither_leaves_it_empty(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        toml = self._toml(tmp_path, "\n[experiment]\n")
+        cfg = build_config(["--config", str(toml)])
+        assert cfg.experiment is not None
+        assert cfg.experiment.name == ""

@@ -49,7 +49,7 @@ The installable package lives under `src/apeiron/` (imported as `apeiron`; see `
 
 ### Configuration Format (TOML)
 Required sections: `[model]` (name, pretrained_path), `[data]` (name, path, batch_size, memmap), `[train]` (batch_size, num_workers, init_lr), `[drift_detection]` (detector_name, detection_interval, etc).
-Optional sections: `[continual_learning]` (update_mode, lambda params), `[logging]` (backend = "wandb"|"mlflow"|"none", experiment_name, mlflow_tracking_uri, metrics_output_path), `[experiment]` (path -- default "output"; name -- groups an experiment's runs; run_name -- labels one run; restart_interval -- resilience saves; datasets_path -- dataset store location; bounded run directories + event log).
+Optional sections: `[continual_learning]` (update_mode, lambda params), `[logging]` (backend = "wandb"|"mlflow"|"none", experiment_name, mlflow_tracking_uri, metrics_output_path), `[experiment]` (path -- default "output"; name -- groups an experiment's runs, defaulting to [logging] experiment_name; run_name -- labels one run; restart_interval -- resilience saves; datasets_path -- dataset store location; bounded run directories + event log).
 Top-level keys: `seed`, `device` ("auto"|"cpu"|"cuda"|"mps"), `multi_gpu`.
 
 ### Available Drift Detectors

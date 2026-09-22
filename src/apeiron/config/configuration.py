@@ -208,8 +208,9 @@ class ExperimentCfg:
     # where the working directory is usually the wrong disk.
     path: str = "output"
     # This experiment: runs are allocated under <path>/<name> as run_0001,
-    # run_0002, ... so related runs sit together. Empty puts them directly
-    # under <path>. Anything else already in the directory is left alone.
+    # run_0002, ... so related runs sit together. Empty falls back to
+    # [logging] experiment_name, and puts runs directly under <path> if that
+    # is unset too. Anything else already in the directory is left alone.
     name: str = ""
     run_name: str = ""  # optional label appended to the allocated directory name
     # Where dataset files are kept. Empty means <path>/<name>/datasets, so the
@@ -425,6 +426,11 @@ def build_config(argv=None) -> Config:
     cl = ContinualLearningCfg(**cfg.get("continual_learning", {}))
     log_cfg = LoggingCfg(**cfg["logging"]) if "logging" in cfg else None
     exp_cfg = ExperimentCfg(**cfg["experiment"]) if "experiment" in cfg else None
+    if exp_cfg is not None and not exp_cfg.name and log_cfg is not None:
+        # One name for the experiment: the directory its runs live in and the
+        # project they are tracked under are the same idea. Resolved here so
+        # everything downstream reads one field, and resolved.json records it.
+        exp_cfg = _dc.replace(exp_cfg, name=log_cfg.experiment_name or "")
 
     raw_device = str(
         cfg.get(

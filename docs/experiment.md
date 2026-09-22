@@ -20,8 +20,12 @@ datasets_path = ""       # where data is kept; default <path>/<name>/datasets
 ```
 
 `path` is relative to the working directory, so on a shared machine set it to
-scratch space rather than relying on the default. `name` groups the runs of one
-experiment together; leaving it empty puts runs directly under `path`.
+scratch space rather than relying on the default.
+
+`name` groups the runs of one experiment together. Leaving it empty falls back
+to `[logging] experiment_name` -- the directory an experiment's runs live in
+and the project they are tracked under are the same idea, so there is one name
+for both -- and puts runs directly under `path` if that is unset too.
 
 ## Run directory
 
@@ -107,7 +111,7 @@ up to the moment it died.
 
 | kind | payload | when |
 |---|---|---|
-| `run_started` | `run_dir`, `config_sha256`, `hostname`, `pid` | run directory allocated |
+| `run_started` | `config_sha256` and what software ran: `python`, `torch`, `platform`, `hostname`, `pid`, `argv`, `git` (commit and whether the tree was dirty), `cuda`/`gpu` when present | run directory allocated |
 | `model` | the model record, without the `tensors` table | harness built |
 | `restart_saved` | `reason`, `batch`, `name` | restart state written |
 | `run_continued` | `batch` | resumed with `--continue-from` |
@@ -122,6 +126,12 @@ up to the moment it died.
 `config_sha256` is a hash of the whole config except the `[experiment]`
 section: two runs with the same value should do the same work and differ only
 in where their output lands.
+
+The rest of `run_started` answers a question the config cannot: a config says
+what was asked for, not which version of the code answered. The git commit and
+dirty flag are recorded when the working tree is a repository. None of it takes
+part in the signature -- a torch upgrade is worth knowing about, but it is not
+a behavioural difference the framework is in a position to judge.
 
 Query it with any SQLite client:
 
