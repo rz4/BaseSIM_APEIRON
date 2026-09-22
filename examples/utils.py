@@ -11,6 +11,10 @@ def get_example(cfg: Config) -> BaseModelHarness:
         from examples.cifar.model import CIFAR_VISION
 
         return CIFAR_VISION(cfg=cfg)
+    elif cfg.data.name.startswith("well:"):
+        from examples.well.model import WELL_FNO
+
+        return WELL_FNO(cfg=cfg)
     elif cfg.data.name == "imagenet":
         from examples.imagenet.model import IMAGENET_VISION
 

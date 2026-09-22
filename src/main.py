@@ -3,7 +3,7 @@ import sys
 
 from apeiron.logger import get_logger, configure_backend
 from apeiron.config.configuration import build_config, parse_args, Config
-from apeiron.experiment import DatasetStore, Run, RunInterrupted, seed_everything
+from apeiron.experiment import Run, RunInterrupted, seed_everything
 
 from examples.utils import get_example
 
@@ -54,7 +54,6 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(f"==== Run directory: {run.run_dir} ====", level=0)
 
     modelHarness = get_example(cfg=cfg)
-    modelHarness.datasets = DatasetStore.for_config(cfg)
 
     if run is not None and not resuming:
         run.record_model(modelHarness)

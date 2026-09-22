@@ -30,13 +30,7 @@ from apeiron.config.configuration import (
 )
 from apeiron.driver.continuous_monitor import ContinuousMonitor
 from apeiron.evaluation.metrics import accuracy
-from apeiron.experiment import (
-    DatasetStore,
-    Journal,
-    Run,
-    RunInterrupted,
-    seed_everything,
-)
+from apeiron.experiment import Journal, Run, RunInterrupted, seed_everything
 from apeiron.experiment.determinism import rng_state, set_rng_state
 from apeiron.experiment.restart import KEEP, RestartStore
 from apeiron.model.torch_model_harness import BaseModelHarness
@@ -133,18 +127,12 @@ def _quiet_logger():
             yield mock
 
 
-def _build(cfg: Config, harness_cls=DriftingHarness) -> DriftingHarness:
-    harness = harness_cls(cfg)
-    harness.datasets = DatasetStore.for_config(cfg)
-    return harness
-
-
 def _start(cfg: Config, harness_cls=DriftingHarness) -> tuple[Run, ContinuousMonitor]:
     """What main() does: allocate, bind, seed, build, monitor."""
     run = Run.create(cfg)
     bound = run.bind(cfg)
     seed_everything(bound.seed)
-    harness = _build(bound, harness_cls)
+    harness = harness_cls(bound)
     run.record_model(harness)
     return run, ContinuousMonitor(cfg=bound, modelHarness=harness, run=run)
 
@@ -154,7 +142,7 @@ def _reopen(run_dir, harness_cls=DriftingHarness) -> tuple[Run, ContinuousMonito
     run = Run.open(run_dir)
     bound = run.bind(run.resolved_config())
     seed_everything(bound.seed)
-    harness = _build(bound, harness_cls)
+    harness = harness_cls(bound)
     monitor = ContinuousMonitor(cfg=bound, modelHarness=harness, run=run)
     state = run.load_restart()
     assert state is not None

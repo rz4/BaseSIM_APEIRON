@@ -1,0 +1,56 @@
+# The Well: turbulent radiative layer (2D), nine regimes of a cooling-time sweep.
+#
+#   poetry run python -m src.main --config examples/well/well_trl2d.toml
+#
+# Each regime is a ~650 MB file fetched when the run reaches it, and converted
+# once into a memory-mappable array. Budget ~1.3 GB of disk per regime.
+# For a quick look, stop after one window:
+#   --set drift_detection.max_stream_updates=1
+
+seed = 1337
+# cpu: the FFTs an FNO leans on are unreliable on MPS.
+device = "cpu"
+verbosity = "INFO"
+
+[model]
+name = "fno"
+pretrained_path = ""     # a local state dict, if you have one
+max_ckpts = 3
+ckpts_path = ""          # rewritten to point inside the run directory
+
+[data]
+name = "well:turbulent_radiative_layer_2D"
+path = "hf://datasets/polymathic-ai"   # or a directory holding the dataset
+batch_size = 4           # monitoring stream
+memmap = true
+
+[train]
+batch_size = 4
+num_workers = 0
+init_lr = 1e-3
+max_iter = 40            # inner steps per drift event
+grad_accumulation_steps = 1
+
+[continual_learning]
+update_mode = "ewc_online"
+mix_historic_data = true
+ewc_lambda = 1000.0
+ewc_ema_decay = 0.95
+
+[drift_detection]
+detector_name = "ADWINDetector"
+detection_interval = 10
+aggregation = "mean"
+metric_index = 0         # vrmse: lower is better
+reset_after_learning = false
+max_stream_updates = 8   # nine regimes, eight advances
+
+[logging]
+backend = "none"
+experiment_name = "well-turbulent-radiative-layer"
+metrics_output_path = ""  # rewritten to point inside the run directory
+
+[experiment]
+path = "output"
+name = "well_trl2d"
+restart_interval = 200    # batches between restart saves

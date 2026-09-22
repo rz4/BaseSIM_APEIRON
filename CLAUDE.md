@@ -44,10 +44,11 @@ The installable package lives under `src/apeiron/` (imported as `apeiron`; see `
 - `examples/mnist/model.py`: `MNIST_CNN` -- CNN on MNIST with affine drift simulation.
 - `examples/cifar/model.py`: `CIFAR_VISION` -- ViT/VGG on CIFAR-10 with affine drift.
 - `examples/imagenet/model.py`: `IMAGENET_VISION` -- ViT on ImageNet with affine drift.
+- `examples/well/model.py`: `WELL_FNO` -- The Well (PolymathicAI) under real physical regime drift: one window per HDF5 file of a parameter sweep, fetched per window, converted once to a memory-mappable array, VRMSE metric. `examples/well/fno.py` is a small self-contained FNO. `data.name = "well:<dataset>"`; requires an `[experiment]` section.
 - `examples/utils.py`: `get_example(cfg)` factory dispatching on `cfg.data.name`.
 
 ### Configuration Format (TOML)
-Required sections: `[model]` (name, pretrained_path), `[data]` (name, path), `[train]` (batch_size, num_workers, init_lr), `[drift_detection]` (detector_name, detection_interval, etc).
+Required sections: `[model]` (name, pretrained_path), `[data]` (name, path, batch_size, memmap), `[train]` (batch_size, num_workers, init_lr), `[drift_detection]` (detector_name, detection_interval, etc).
 Optional sections: `[continual_learning]` (update_mode, lambda params), `[logging]` (backend = "wandb"|"mlflow"|"none", experiment_name, mlflow_tracking_uri, metrics_output_path), `[experiment]` (path -- default "output"; name -- groups an experiment's runs; run_name -- labels one run; restart_interval -- resilience saves; datasets_path -- dataset store location; bounded run directories + event log).
 Top-level keys: `seed`, `device` ("auto"|"cpu"|"cuda"|"mps"), `multi_gpu`.
 

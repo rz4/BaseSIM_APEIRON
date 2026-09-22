@@ -268,6 +268,10 @@ An artifact with no marker is not trusted either, so a file dropped into the
 store by hand is rebuilt rather than assumed current. That is the one place
 hand-staging does not apply -- stage the sources, not the conversions.
 
+A worked example of all of this -- per-window fetching, conversion, fixed
+normalisation and resume -- is `examples/well/`, which runs The Well's nine
+turbulent-radiative-layer regimes as nine windows.
+
 ### What is recorded
 
 The `window` event carries the names the window declared, so the log says what

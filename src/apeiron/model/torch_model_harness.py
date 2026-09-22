@@ -10,8 +10,10 @@ from torch.optim import Optimizer
 
 from apeiron.config.configuration import Config
 
+from apeiron.experiment.datasets import DatasetStore
+
 if TYPE_CHECKING:
-    from apeiron.experiment.datasets import DatasetStore, EnsureResult
+    from apeiron.experiment.datasets import EnsureResult
 
 MetricFn = Callable[[Tensor, Tensor], Any]
 CriterionFn = Callable[[Tensor, Tensor], Tensor]
@@ -37,8 +39,10 @@ class BaseModelHarness(ABC):
 
         self.eval_metrics: Dict[str, MetricFn] = {}
 
-        # Set by the runner in experiment mode; see window_inputs().
-        self.datasets: DatasetStore | None = None
+        # The dataset store this config asks for, or None outside experiment
+        # mode. Available to subclasses after super().__init__(); see
+        # window_inputs().
+        self.datasets: DatasetStore | None = DatasetStore.for_config(cfg)
 
         # One entry per drift event, oldest first: the frozen validation split of
         # the window that was adapted to, paired with R[i][i] (see register_task).

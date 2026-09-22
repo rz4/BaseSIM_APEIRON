@@ -110,6 +110,9 @@ class DataCfg:
     name: str
     path: str
     batch_size: int = 1  # streaming batch size
+    # Convert source files into memory-mappable arrays once, and read those.
+    # Harnesses that do not declare a conversion ignore this.
+    memmap: bool = True
 
 
 @dataclass(frozen=True)
