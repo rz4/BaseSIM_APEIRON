@@ -70,15 +70,29 @@ class DriftingHarness(BaseModelHarness):
 
     def update_data_stream(self) -> None:
         self.window += 1
-        self._stream = self._dataset(256, self.window * 30)
-        self._train = self._dataset(32, self.window * 30)
+        self._stream = self._dataset(1024, self.window * 40)
+        # deliberately not a multiple of the batch size: the short batch at
+        # the end of an epoch is skipped, so how far a loader has got cannot
+        # be worked out from the iteration number
+        self._train = self._dataset(70, self.window * 40)
+        # Built once per window, the way a real harness does it.
+        self._stream_loader = DataLoader(
+            self._stream,
+            batch_size=8,
+            sampler=self.make_sampler("stream", len(self._stream), self.window),
+        )
+        self._train_loader = DataLoader(
+            self._train,
+            batch_size=8,
+            sampler=self.make_sampler("train", len(self._train), self.window),
+        )
+        self._valid_loader = DataLoader(self._train, batch_size=8)
 
     def get_stream_dataloader(self) -> DataLoader:
-        return DataLoader(self._stream, batch_size=8, shuffle=True)
+        return self._stream_loader
 
     def get_train_dataloaders(self):
-        loader = DataLoader(self._train, batch_size=8, shuffle=True)
-        return loader, DataLoader(self._train, batch_size=8)
+        return self._train_loader, self._valid_loader
 
     def get_hist_dataloaders(self):
         return (None, None)
@@ -103,11 +117,11 @@ def _cfg(tmp_path, **experiment) -> Config:
     return Config(
         model=ModelCfg(name="tiny", max_ckpts=2, ckpts_path="ignored"),
         data=DataCfg(name="synthetic", path="", batch_size=8),
-        train=TrainCfg(batch_size=8, num_workers=0, init_lr=0.05, max_iter=3),
+        train=TrainCfg(batch_size=8, num_workers=0, init_lr=0.05, max_iter=12),
         continual_learning=ContinualLearningCfg(update_mode="ewc_online"),
         drift_detection=DriftDetectionCfg(
             detector_name="ADWINDetector",
-            detection_interval=2,
+            detection_interval=4,
             max_stream_updates=3,
             metric_index=1,
         ),
@@ -149,6 +163,19 @@ def _reopen(run_dir, harness_cls=DriftingHarness) -> tuple[Run, ContinuousMonito
     monitor.restore_state(state)
     run.record("run_continued", batch=state["batch_count"])
     return run, monitor
+
+
+def _interrupt_in_round(monitor: ContinuousMonitor, iteration: int) -> None:
+    """Ask to stop partway through a round of learning."""
+    original = monitor.trainer.on_inner_step
+    assert original is not None
+
+    def hook(drift_event_id: int, iter_count: int) -> None:
+        if iter_count >= iteration:
+            monitor.request_interrupt()
+        original(drift_event_id, iter_count)
+
+    monitor.trainer.on_inner_step = hook
 
 
 def _interrupt_at(monitor: ContinuousMonitor, batch: int) -> None:
@@ -433,6 +460,52 @@ class TestCrashEquivalence:
         assert [w.payload["inputs"] for w in windows] == [
             [f"w{i}.bin"] for i in range(len(windows))
         ]
+        log.close()
+
+    @pytest.mark.parametrize("stop_after_iteration", [0, 4, 10])
+    def test_interrupted_inside_a_round(self, tmp_path, stop_after_iteration):
+        """A save taken mid-training must come back to the same place."""
+        reference = self._reference(tmp_path)
+
+        run, monitor = _start(
+            _cfg(tmp_path, name=f"inround{stop_after_iteration}", restart_interval=1)
+        )
+        _interrupt_in_round(monitor, stop_after_iteration)
+        with pytest.raises(RunInterrupted):
+            monitor.run()
+        state = run.load_restart()
+        assert state is not None
+        assert state["round"] is not None  # caught inside a round, not between
+        assert state["round"]["next_iteration"] == stop_after_iteration + 1
+        run_dir = run.run_dir
+        run.finish(status="interrupted")
+
+        resumed_run, resumed = _reopen(run_dir)
+        resumed.run()
+        assert resumed_run.finish() == reference
+
+    def test_a_resumed_round_is_not_recorded_twice(self, tmp_path):
+        self._reference(tmp_path)
+        run, monitor = _start(_cfg(tmp_path, name="once", restart_interval=1))
+        _interrupt_in_round(monitor, 1)
+        with pytest.raises(RunInterrupted):
+            monitor.run()
+        run_dir = run.run_dir
+        run.finish(status="interrupted")
+
+        resumed_run, resumed = _reopen(run_dir)
+        resumed.run()
+        resumed_run.finish()
+
+        log = Journal(run_dir / "journal.sqlite")
+        starts = log.events("cl_started")
+        finishes = log.events("cl_finished")
+        # one start and one finish per drift event, despite the interruption
+        assert len(starts) == len(finishes)
+        assert [e.payload["drift_event_id"] for e in starts] == sorted(
+            e.payload["drift_event_id"] for e in starts
+        )
+        assert len(set(e.payload["drift_event_id"] for e in starts)) == len(starts)
         log.close()
 
     def test_two_interruptions_still_match(self, tmp_path):

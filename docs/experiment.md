@@ -120,6 +120,8 @@ up to the moment it died.
 | `dataset` | `wanted`, `present`, `fetched`, `built`, `bytes_fetched`, `seconds` | window data made ready |
 | `drift_check` | `window`, `batch`, `value`, `detected`, `score` | every drift check, including negative ones |
 | `drift` | `event`, `window`, `batch`, `score`, `regime` | drift detected, before training starts |
+| `cl_started` | `drift_event_id`, `update_mode`, `metrics`, `pre_cur`, `pre_hist` | learning begins |
+| `cl_finished` | `drift_event_id`, `iterations`, `post_cur`, `post_hist`, `fwt`, `bwt` | learning ends |
 | `checkpoint` | `event`, `name`, `path` | checkpoint written |
 | `run_finished` | `status`, `elapsed_s` | run ends, including on failure |
 
@@ -142,6 +144,12 @@ FROM events WHERE kind = 'drift_check' ORDER BY id;
 
 -- drift events and the checkpoints they produced
 SELECT kind, payload FROM events WHERE kind IN ('drift', 'checkpoint') ORDER BY id;
+
+-- did adapting help? forward and backward transfer per drift event
+SELECT json_extract(payload, '$.drift_event_id'),
+       json_extract(payload, '$.fwt'),
+       json_extract(payload, '$.bwt')
+FROM events WHERE kind = 'cl_finished' ORDER BY id;
 ```
 
 or from Python:
@@ -307,14 +315,48 @@ not a resume.
 
 ### When state is saved
 
-At batch boundaries in the monitoring loop, either every `restart_interval`
-batches or when the process is signalled. **Never inside a training round**: a
-round is treated as one unit, so a run killed during training replays that
-round from its start. The cost is bounded by one round; the benefit is that
-training needs no resume logic at all.
+At batch boundaries in the monitoring loop and after each step of learning,
+either every `restart_interval` of them or when the process is signalled.
+Inside a round of learning the batch counter stands still, so the iteration is
+what the interval counts.
 
 With `restart_interval = 0` state is saved only on a signal, which survives a
 walltime kill but not an abrupt one. Set an interval to survive both.
+
+### Landing back inside a round
+
+Resuming mid-round means re-entering `outer_cl_training_loop` where it stopped:
+the evaluation that preceded it is carried in rather than redone, the updater's
+preparation is not repeated, and the training loaders are wound forward to the
+batch the next iteration would have seen.
+
+How far a loader had got **cannot** be worked out from the iteration number --
+the two part company as soon as a short batch at the end of an epoch has been
+skipped -- so the count of batches actually taken is recorded and replayed.
+
+For the replay to land on the same batch, a shuffling loader must not depend on
+how much randomness was drawn before it. Use a sampler instead of
+`shuffle=True`:
+
+```python
+def update_data_stream(self) -> None:
+    ...
+    self._train_loader = DataLoader(
+        train,
+        batch_size=self.cfg.train.batch_size,
+        sampler=self.make_sampler("train", len(train), self.window),
+    )
+```
+
+Each epoch's order is then a pure function of the seed, the window, the role
+and the epoch index, so carrying a resume across it needs one integer per
+loader. Asking for the same role, window and length twice returns the same
+sampler, because harnesses do rebuild loaders mid-window -- `eval()` calls
+`get_train_dataloaders()` again -- and a fresh sampler each time would quietly
+reset the count.
+
+A harness that keeps `shuffle=True` still resumes at batch granularity; only
+the mid-round case needs the sampler.
 
 ### Stopping on a signal
 
@@ -332,11 +374,10 @@ with status `interrupted`.
 ### What is saved
 
 Model weights, optimizer state, every random generator, the drift detector, the
-updater's memory across drift events (EWC's Fisher and anchor, KFAC's factors),
-the loop's counters including the partially filled metric buffer, and the
-position in the event log.
-
-Per-round accumulators are not saved, because the round replays.
+updater's memory -- both what it carries across drift events (EWC's Fisher and
+anchor, KFAC's factors) and the accumulators belonging to a round in progress --
+the loop's counters including the partially filled metric buffer, each
+sampler's epoch count, and the position in the event log.
 
 ### Correctness
 
@@ -361,6 +402,32 @@ never interrupted. That is what the tests assert, and it is checkable by hand:
 diff output/mnist_drift/run_0001/signature.txt \
      output/mnist_drift/run_0002/signature.txt
 ```
+
+## Looking at an experiment
+
+```bash
+python -m apeiron.experiment output/mnist_drift
+```
+
+```
+run                  status      win drift ckpt cont        fwt        bwt  signature
+run_0001             finished      9     4    4    0      2.310    -0.4120  961c49af
+run_0002             finished      9     4    4    1      2.310    -0.4120  961c49af
+run_0003             interrupted   6     2    2    0      1.905    -0.2280  1f0ac33b
+
+same behaviour: run_0001, run_0002
+
+datasets: 11.4 GB
+```
+
+Everything is derived from what the runs already wrote. A run with no closing
+event is reported as "running or crashed", since from the outside those look
+the same, and as resumable when it has restart state. A run that never finished
+has no `signature.txt`, so its signature is computed on the spot and can still
+be compared.
+
+Point the command at a directory holding several experiments and it lists them
+instead.
 
 ## Comparing runs
 

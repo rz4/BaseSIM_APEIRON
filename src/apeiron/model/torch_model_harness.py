@@ -11,6 +11,7 @@ from torch.optim import Optimizer
 from apeiron.config.configuration import Config
 
 from apeiron.experiment.datasets import DatasetStore
+from apeiron.experiment.determinism import EpochSeededSampler
 
 if TYPE_CHECKING:
     from apeiron.experiment.datasets import EnsureResult
@@ -43,6 +44,9 @@ class BaseModelHarness(ABC):
         # mode. Available to subclasses after super().__init__(); see
         # window_inputs().
         self.datasets: DatasetStore | None = DatasetStore.for_config(cfg)
+
+        # Deterministic shuffling samplers, by role. See make_sampler().
+        self._samplers: Dict[str, EpochSeededSampler] = {}
 
         # One entry per drift event, oldest first: the frozen validation split of
         # the window that was adapted to, paired with R[i][i] (see register_task).
@@ -262,6 +266,45 @@ class BaseModelHarness(ABC):
         if not wanted or self.datasets is None:
             return None
         return self.datasets.ensure(wanted)
+
+    def make_sampler(self, role: str, length: int, window: int) -> EpochSeededSampler:
+        """A shuffling sampler that a resumed run can land back inside.
+
+        Pass the result as a loader's ``sampler=`` instead of
+        ``shuffle=True``. Each epoch's order is a pure function of the seed,
+        the window, the role and the epoch index, so resuming in the middle
+        of training needs one integer per loader rather than a replay of
+        every random draw that came before.
+
+        ``role`` names the loader within a window -- ``"train"``, ``"hist"``,
+        ``"stream"`` -- and must be distinct per loader, or two of them will
+        draw the same order.
+
+        Asking twice for the same role, window and length gives back the same
+        sampler. Harnesses do rebuild a loader mid-window -- ``eval()`` calls
+        ``get_train_dataloaders()`` again, for one -- and a fresh sampler each
+        time would silently reset the epoch counter a resume relies on.
+        """
+        existing = self._samplers.get(role)
+        if (
+            existing is not None
+            and existing.window == window
+            and existing.length == length
+        ):
+            return existing
+        sampler = EpochSeededSampler(length, self.cfg.seed, window, role)
+        self._samplers[role] = sampler
+        return sampler
+
+    def sampler_state(self) -> Dict[str, int]:
+        """How many epochs each sampler has handed out. Saved with a restart."""
+        return {role: s.epochs_started for role, s in self._samplers.items()}
+
+    def load_sampler_state(self, state: Dict[str, int]) -> None:
+        """Put the samplers back to a recorded point."""
+        for role, epochs in state.items():
+            if role in self._samplers:
+                self._samplers[role].epochs_started = int(epochs)
 
     def model_config(self) -> Dict[str, Any]:
         """Return the model's own hyperparameters, if it has any worth keeping.

@@ -83,6 +83,7 @@ class ContinuousMonitor:
             modelHarness=self.modelHarness,
             logger=self.logger,
             profiler=self.flops_profiler,
+            run=run,
         )
 
         # Configuration
@@ -109,6 +110,13 @@ class ContinuousMonitor:
         self._resume_rng: dict | None = None
         self._resume_window_rng: dict | None = None
         self._window_inputs: list[str] = []
+        self._pass_samplers: dict[str, int] = {}
+        self._resume_samplers: dict[str, int] | None = None
+        # Set while a round of learning is running, so a save taken inside one
+        # knows where to come back to.
+        self._round: tuple[int, int] | None = None
+        self._resume_round: dict | None = None
+        self.trainer.on_inner_step = self._on_inner_step
 
         self.logger.info("==== ContinuousMonitor initialized ====", level=0)
         self.logger.info(f"\tDetector: {cfg.drift_detection.detector_name}", level=1)
@@ -141,6 +149,10 @@ class ContinuousMonitor:
             "drift_event_count": self.drift_event_count,
             "batches_in_pass": self._batches_in_pass,
             "metric_buffer": [list(m) for m in self.metric_buffer],
+            "pass_samplers": dict(self._pass_samplers),
+            "round": (
+                None if self._round is None else self.trainer.round_state(*self._round)
+            ),
             "model": model.state_dict(),
             "trainer": self.trainer.state_dict(),
             "detector": self.detector,
@@ -192,6 +204,22 @@ class ContinuousMonitor:
         self._resume_skip = int(state["batches_in_pass"])
         self._resume_rng = state["rng"]
         self._resume_window_rng = state["window_rng"]
+        self._resume_samplers = dict(state.get("pass_samplers") or {})
+
+        self._resume_round = state.get("round")
+        if self._resume_round is not None:
+            # The generators have to come back inside the round, after its
+            # loaders are wound forward -- not here.
+            self._resume_round = {**self._resume_round, "rng": state["rng"]}
+            self._resume_rng = None
+
+    def _on_inner_step(self, drift_event_id: int, iteration: int) -> None:
+        """Called by the trainer after each step of learning."""
+        self._round = (drift_event_id, iteration)
+        try:
+            self._tick_restart()
+        finally:
+            self._round = None
 
     def _save_restart(self, reason: str) -> None:
         if self._run is not None:
@@ -209,7 +237,12 @@ class ContinuousMonitor:
                 level=0,
             )
             raise RunInterrupted()
-        if self.restart_interval > 0 and self.batch_count % self.restart_interval == 0:
+        if self.restart_interval <= 0:
+            return
+        # Inside a round the batch counter stands still, so the iteration is
+        # what advances.
+        counter = self._round[1] + 1 if self._round is not None else self.batch_count
+        if counter % self.restart_interval == 0:
             self._save_restart("interval")
 
     def _ensure_window_inputs(self) -> None:
@@ -257,6 +290,7 @@ class ContinuousMonitor:
                 f"batch {self.batch_count}",
                 level=1,
             )
+            self._finish_interrupted_round()
         else:
             self._record(
                 "window",
@@ -274,6 +308,28 @@ class ContinuousMonitor:
         self.logger.info("==== Continuous Monitoring Complete ====", level=0)
         self.logger.info(f"\tTotal batches processed: {self.batch_count}", level=1)
         self.logger.info(f"\tTotal stream updates: {self.stream_update_count}", level=1)
+
+    def _finish_interrupted_round(self) -> None:
+        """Re-enter a round of learning that a save caught in the middle.
+
+        The stream carries on from the batch where drift fired, which is what
+        an uninterrupted run would have done.
+        """
+        if self._resume_round is None:
+            return
+        resume, self._resume_round = self._resume_round, None
+        self.logger.info(
+            f"\tFinishing interrupted learning: event "
+            f"{resume['drift_event_id']}, from iteration "
+            f"{resume['next_iteration']}",
+            level=0,
+        )
+        self.trainer.outer_cl_training_loop(
+            drift_event_id=int(resume["drift_event_id"]), resume=resume
+        )
+        self._save_checkpoint()
+        if self.cfg.drift_detection.reset_after_learning:
+            self.detector.reset()
 
     def _process_stream(self) -> None:
         """Process batches from current data stream.
@@ -295,6 +351,11 @@ class ContinuousMonitor:
             self._resume_window_rng = None
         else:
             self._window_rng = rng_state()
+
+        if self._resume_samplers is not None:
+            self.modelHarness.load_sampler_state(self._resume_samplers)
+            self._resume_samplers = None
+        self._pass_samplers = self.modelHarness.sampler_state()
 
         val_loader = self.modelHarness.get_stream_dataloader()
         self._batches_in_pass = 0
@@ -491,15 +552,7 @@ class ContinuousMonitor:
             drift_event_id=self.drift_event_count,
         )
 
-        if self.modelHarness.ckpts_enabled:
-            ckptpath = self.modelHarness.save_ckpt(event=self.drift_event_count)
-            self.logger.info(f"* Checkpoint saved to: {ckptpath}", level=0)
-            self._record(
-                "checkpoint",
-                event=self.drift_event_count,
-                name=Path(ckptpath).name,
-                path=ckptpath,
-            )
+        self._save_checkpoint()
 
         self.logger.info("<- Continual learning complete.", level=0)
 
@@ -509,6 +562,19 @@ class ContinuousMonitor:
             self.detector.reset()
 
         self.logger.info("==== RESUMING MONITORING! ====", level=0)
+
+    def _save_checkpoint(self) -> None:
+        """Write the post-learning checkpoint, if checkpointing is on."""
+        if not self.modelHarness.ckpts_enabled:
+            return
+        ckptpath = self.modelHarness.save_ckpt(event=self.drift_event_count)
+        self.logger.info(f"* Checkpoint saved to: {ckptpath}", level=0)
+        self._record(
+            "checkpoint",
+            event=self.drift_event_count,
+            name=Path(ckptpath).name,
+            path=ckptpath,
+        )
 
     def _extend_stream(self) -> None:
         """Extend the data stream when exhausted.

@@ -320,11 +320,22 @@ class WELL_FNO(BaseModelHarness):
         mean, std = self._normalisation()
         return RegimeDataset(self._frames(split, regime), mean, std)
 
-    def _loader(self, dataset: Dataset, batch_size: int, shuffle: bool) -> DataLoader:
+    def _loader(self, dataset: Dataset, batch_size: int, role: str = "") -> DataLoader:
+        """A loader over one or more regimes.
+
+        ``role`` shuffles through a sampler whose every epoch is a pure
+        function of its index, so a run interrupted partway through training
+        lands back on the same batch. No role means no shuffling.
+        """
+        sampler = (
+            self.make_sampler(role, len(dataset), self.window)  # type: ignore[arg-type]
+            if role
+            else None
+        )
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.cfg.train.num_workers,
             drop_last=False,
         )
@@ -337,9 +348,9 @@ class WELL_FNO(BaseModelHarness):
         train = self._dataset("train", regime)
         valid = self._dataset("valid", regime)
         self._loaders = {
-            "stream": self._loader(valid, self.cfg.data.batch_size, shuffle=True),
-            "train": self._loader(train, self.cfg.train.batch_size, shuffle=True),
-            "valid": self._loader(valid, self.cfg.train.batch_size, shuffle=False),
+            "stream": self._loader(valid, self.cfg.data.batch_size, role="stream"),
+            "train": self._loader(train, self.cfg.train.batch_size, role="train"),
+            "valid": self._loader(valid, self.cfg.train.batch_size),
         }
 
     def get_stream_dataloader(self) -> DataLoader:
@@ -358,6 +369,6 @@ class WELL_FNO(BaseModelHarness):
         train: Dataset = ConcatDataset([self._dataset("train", r) for r in prior])
         valid: Dataset = ConcatDataset([self._dataset("valid", r) for r in prior])
         return (
-            self._loader(train, self.cfg.train.batch_size, shuffle=True),
-            self._loader(valid, self.cfg.train.batch_size, shuffle=False),
+            self._loader(train, self.cfg.train.batch_size, role="hist"),
+            self._loader(valid, self.cfg.train.batch_size),
         )

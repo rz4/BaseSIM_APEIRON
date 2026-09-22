@@ -30,11 +30,16 @@ class SpectralConv2d(nn.Module):
         self.modes_x = modes_x
 
         scale = 1.0 / (in_channels * out_channels)
-        shape = (in_channels, out_channels, modes_y, modes_x)
         # Two blocks: the lowest positive and lowest negative y frequencies.
         # rfft2 keeps only non-negative x frequencies, so x needs one block.
-        self.low = nn.Parameter(scale * torch.randn(*shape, dtype=torch.cfloat))
-        self.high = nn.Parameter(scale * torch.randn(*shape, dtype=torch.cfloat))
+        #
+        # Stored real, as (..., 2) pairs viewed as complex in the forward pass.
+        # Complex parameters are awkward for everything downstream -- the EWC
+        # penalty sums to a complex number, and checkpoint tooling has to know
+        # about complex dtypes -- and none of that buys anything here.
+        shape = (in_channels, out_channels, modes_y, modes_x, 2)
+        self.low = nn.Parameter(scale * torch.randn(*shape))
+        self.high = nn.Parameter(scale * torch.randn(*shape))
 
     def forward(self, x: Tensor) -> Tensor:
         batch, _, height, width = x.shape
@@ -51,11 +56,13 @@ class SpectralConv2d(nn.Module):
             dtype=torch.cfloat,
             device=x.device,
         )
+        low = torch.view_as_complex(self.low)
+        high = torch.view_as_complex(self.high)
         out[:, :, :my, :mx] = torch.einsum(
-            "bixy,ioxy->boxy", spectrum[:, :, :my, :mx], self.low[:, :, :my, :mx]
+            "bixy,ioxy->boxy", spectrum[:, :, :my, :mx], low[:, :, :my, :mx]
         )
         out[:, :, -my:, :mx] = torch.einsum(
-            "bixy,ioxy->boxy", spectrum[:, :, -my:, :mx], self.high[:, :, :my, :mx]
+            "bixy,ioxy->boxy", spectrum[:, :, -my:, :mx], high[:, :, :my, :mx]
         )
         return torch.fft.irfft2(out, s=(height, width))
 

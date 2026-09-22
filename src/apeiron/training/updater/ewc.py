@@ -46,10 +46,21 @@ class OnlineEWCUpdater(BaseUpdater):
         self._cl_steps = 0
 
     def state_dict(self) -> dict[str, object]:
-        """The prior: anchor and Fisher. Both outlive a CL round."""
+        """The prior, plus the round in progress.
+
+        Anchor and Fisher outlive a round. The accumulator and step count do
+        not, but a run resumed inside a round skips the preparation that
+        would have created them, so they have to come back too.
+        """
         return {
             "theta_star": {n: t.detach().cpu() for n, t in self.theta_star.items()},
             "fisher": {n: t.detach().cpu() for n, t in self.fisher.items()},
+            "cl_fisher_accum": (
+                None
+                if self._cl_fisher_accum is None
+                else {n: t.detach().cpu() for n, t in self._cl_fisher_accum.items()}
+            ),
+            "cl_steps": self._cl_steps,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -61,6 +72,15 @@ class OnlineEWCUpdater(BaseUpdater):
             for name, tensor in saved.items():
                 if name in target:
                     target[name] = tensor.to(self.device)
+
+        accum = state.get("cl_fisher_accum")
+        self._cl_fisher_accum = (
+            {n: t.to(self.device) for n, t in accum.items()}
+            if isinstance(accum, dict)
+            else None
+        )
+        steps = state.get("cl_steps", 0)
+        self._cl_steps = int(steps) if isinstance(steps, (int, float)) else 0
 
     @torch.no_grad()
     def cl_preprocessing(self) -> None:

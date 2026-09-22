@@ -54,11 +54,25 @@ class OnlineKFACUpdater(BaseUpdater):
     # ------------------------------------------------------------------
 
     def state_dict(self) -> dict[str, object]:
-        """The prior: anchor and the Kronecker factors. All outlive a round."""
-        return {
+        """The prior, plus the round in progress.
+
+        Anchor and Kronecker factors outlive a round. The accumulators do
+        not, but a run resumed inside a round skips the preparation that
+        would have created them, so they have to come back too.
+        """
+        saved: dict[str, object] = {
             key: {n: t.detach().cpu() for n, t in getattr(self, key).items()}
             for key in ("theta_star", "A", "G")
         }
+        for key in ("_A_accum", "_G_accum"):
+            accum = getattr(self, key)
+            saved[key.lstrip("_")] = (
+                None
+                if accum is None
+                else {n: t.detach().cpu() for n, t in accum.items()}
+            )
+        saved["cl_steps"] = self._cl_steps
+        return saved
 
     def load_state_dict(self, state: dict[str, object]) -> None:
         for key in ("theta_star", "A", "G"):
@@ -69,6 +83,18 @@ class OnlineKFACUpdater(BaseUpdater):
             for name, tensor in saved.items():
                 if name in target:
                     target[name] = tensor.to(self.device)
+
+        for key in ("A_accum", "G_accum"):
+            accum = state.get(key)
+            setattr(
+                self,
+                f"_{key}",
+                {n: t.to(self.device) for n, t in accum.items()}
+                if isinstance(accum, dict)
+                else None,
+            )
+        steps = state.get("cl_steps", 0)
+        self._cl_steps = int(steps) if isinstance(steps, (int, float)) else 0
 
     def _init_prior(self):
         for name, module in self.model.named_modules():
