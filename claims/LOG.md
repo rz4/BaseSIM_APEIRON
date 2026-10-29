@@ -118,6 +118,8 @@ pinned claim files, where a renumber would move claim roots.
 | R33 | methodology | fixed here | a constraint satisfied in a room that does not ship the file constrains a copy that is discarded |
 | A77 | APEIRON | open | `_adapt` must write the checkpoint itself, keyed on the event id it was given, or scheduled CL never persists |
 | A78 | APEIRON | open | an upstream `match=` pins an exception's wording; the reconstruction's message is better and stays unpinned |
+| A79 | APEIRON | open | a None confidence is logged as the STRING "N/A" in a numeric CSV column, and a real 0.0 would be too |
+| A80 | APEIRON | open | PR #140 review note: fetch() writes downloads in place, so a truncated transfer poisons the cache |
 | R1 | bug (fixed) | closed | reticuli: strict seatbelt broke every furnished claim on macOS |
 | R2 | bug (fixed) | closed | reticuli: `ret init` gitignore patterns miss nested claim stores |
 | R3 | bug (fixed) | closed | reticuli: export dropped the environment file and manifest entries |
@@ -4552,3 +4554,55 @@ Kind: APEIRON (observation / improvement)
 Status: open — worth raising as a question about the test rather than the
 code: either the message is load-bearing and belongs in a constant, or
 the assertion should match the type and the condition instead.
+
+### A79 — a missing confidence is logged as the string "N/A", and a zero one would be too
+Found by running the examples against the regrown framework, not by a
+criterion. The monitor renders the drift row's confidence with a
+truthiness test (`continuous_monitor.py:398`):
+
+    "confidence": (drift_signal.confidence if drift_signal.confidence else "N/A")
+
+Two detectors never set a confidence (PageHinkley leaves it None), so on
+any Page-Hinkley run the metrics CSV's numeric `value` column receives
+the literal string `N/A` on every drift row. A reader of that file gets
+an object-typed column where every other series is float -- each numeric
+analysis of `drift/confidence` needs a coercion step the file gives no
+warning about. And because the test is truthiness rather than
+`is not None`, a detector reporting a GENUINE confidence of 0.0 would
+also print `N/A` -- the value least safe to render as "not applicable".
+
+Exposed by The Well (PR #140), the first example configured with
+PageHinkley: cross-tree comparison showed `drift/confidence` differing on
+all 19 drift rows while 10 of 14 series were identical and the other 3
+were wall-clock. The regrown monitor logs the raw value (missing becomes
+an empty cell, which parses as NaN and keeps the column float). Every
+ADWIN-configured run hides the defect, because ADWIN's confidence
+(1 - delta) is always truthy.
+
+Same disposition as A57's entries: the reconstruction's answer is the
+better one, left unpinned because choosing the replacement is the team's
+call. The row-schema criterion derives from an ADWIN fixture and so
+never sees a confidence-less detector (R27's lesson again -- the fixture
+is too quiet, not too small).
+Kind: APEIRON (defect, reconstruction is right)
+Status: open
+
+### A80 — PR #140's fetch() leaves a truncated download where the cache expects a file
+An observation on the OPEN PR rather than on main, recorded for review
+rather than sent (sign-off rule). `examples/well/datasets.py::fetch`
+streams the regime download straight into its final destination. Our
+first The Well run had its HDF5 truncated mid-transfer (58,485,512 bytes
+of a stored_eof 109,051,904); the partial file landed at the cache path,
+and the second run -- a different implementation tree -- failed
+identically on it:
+
+    OSError: Unable to synchronously open file (truncated file: ...)
+
+So one interrupted download poisons the cache for every later run, and
+the error points at h5py rather than at the transfer. Download to a
+temporary name and rename into place on success -- the rename is atomic
+on the same filesystem -- and a truncated transfer costs a retry instead
+of a corrupted cache. (The run itself, on a clean cache, passes on both
+trees: 10 of 14 series identical, 3 wall-clock, plus A79.)
+Kind: APEIRON (PR review note, held for sign-off)
+Status: open
