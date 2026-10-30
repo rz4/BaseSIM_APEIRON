@@ -177,8 +177,9 @@ def configure_backend(cfg: Any) -> str:
     """Resolve the metrics backend a config asks for.
 
     A config with no ``[logging]`` section -- and ``None`` itself -- means
-    ``"wandb"``. An MLflow tracking URI is applied here, before any run is
-    started.
+    ``"none"``: a run that never asked for telemetry must not reach the
+    network (claims/LOG.md A18; previously this defaulted to wandb). An
+    MLflow tracking URI is applied here, before any run is started.
 
     Raises
     ------
@@ -186,13 +187,13 @@ def configure_backend(cfg: Any) -> str:
         If the configured backend is not one of ``VALID_BACKENDS``.
     """
     if cfg is None:
-        return "wandb"
+        return "none"
 
     logging_cfg = getattr(cfg, "logging", None)
     if logging_cfg is None:
-        return "wandb"
+        return "none"
 
-    backend = getattr(logging_cfg, "backend", None) or "wandb"
+    backend = getattr(logging_cfg, "backend", None) or "none"
     if backend not in VALID_BACKENDS:
         raise ValueError(
             f"Invalid logging backend {backend!r}; expected one of "

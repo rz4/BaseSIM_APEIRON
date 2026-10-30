@@ -459,3 +459,23 @@ class TestConfigurationSurface:
         assert dd.ensemble_detectors == ("ADWINDetector", "KSWINDetector")
         dd = DriftDetectionCfg(ensemble_detectors="ADWINDetector")
         assert dd.ensemble_detectors == ("ADWINDetector",)
+
+
+class TestGradAccumulationRefusesZero:
+    """A59: the loss is divided by this count, and a tensor division by zero
+    raises nothing -- inf loss, NaN weights, run keeps going. Refused at
+    construction instead."""
+
+    def test_zero_is_refused(self):
+        with pytest.raises(ValueError, match="grad_accumulation_steps"):
+            TrainCfg(batch_size=8, num_workers=0, init_lr=0.01,
+                     grad_accumulation_steps=0)
+
+    def test_negative_is_refused(self):
+        with pytest.raises(ValueError, match="grad_accumulation_steps"):
+            TrainCfg(batch_size=8, num_workers=0, init_lr=0.01,
+                     grad_accumulation_steps=-2)
+
+    def test_one_is_the_default_and_fine(self):
+        cfg = TrainCfg(batch_size=8, num_workers=0, init_lr=0.01)
+        assert cfg.grad_accumulation_steps == 1

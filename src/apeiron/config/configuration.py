@@ -34,6 +34,18 @@ class TrainCfg:
     grad_accumulation_steps: int = 1
     max_iter: int = 600
 
+    def __post_init__(self):
+        # The loss is scaled by this count; at 0 the division is by zero and,
+        # being a tensor division, raises nothing -- the loss becomes inf,
+        # backward() carries it into the optimizer, and every weight is NaN
+        # while the run keeps going (claims/LOG.md A59). Refuse at the source.
+        if self.grad_accumulation_steps < 1:
+            raise ValueError(
+                f"train.grad_accumulation_steps must be >= 1, got "
+                f"{self.grad_accumulation_steps}: the loss is divided by this "
+                f"count, and 0 silently turns every weight NaN"
+            )
+
 
 @dataclass(frozen=True)
 class ContinualLearningCfg:

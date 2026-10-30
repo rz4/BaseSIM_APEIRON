@@ -135,12 +135,13 @@ class TestConfigureBackend:
     def _cfg(self, logging_cfg: LoggingCfg | None, default_cfg: Config) -> Config:
         return replace(default_cfg, logging=logging_cfg)
 
-    def test_no_config_defaults_to_wandb(self):
-        assert configure_backend(None) == "wandb"
+    def test_no_config_defaults_to_none(self):
+        """A run that never asked for telemetry stays off the network (A18)."""
+        assert configure_backend(None) == "none"
 
-    def test_missing_logging_section_defaults_to_wandb(self, default_cfg):
-        # worth knowing: a TOML with no [logging] section talks to wandb
-        assert configure_backend(self._cfg(None, default_cfg)) == "wandb"
+    def test_missing_logging_section_defaults_to_none(self, default_cfg):
+        # a TOML with no [logging] section must not talk to wandb (A18)
+        assert configure_backend(self._cfg(None, default_cfg)) == "none"
 
     @pytest.mark.parametrize("backend", ["wandb", "mlflow", "none"])
     def test_valid_backends_pass_through(self, backend, default_cfg):
