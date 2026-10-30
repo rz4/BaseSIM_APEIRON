@@ -106,7 +106,6 @@ class TestNoDetectionIsAlwaysStable:
         ("minor", "moderate"), [(0.3, 0.6), (0.0, 0.0), (0.02, 0.01)]
     )
     def test_a_flat_stream_stays_stable(self, minor, moderate):
-        detector = ADWINDetector(minor_threshold=minor,
-                                 moderate_threshold=moderate)
+        detector = ADWINDetector(minor_threshold=minor, moderate_threshold=moderate)
         regimes = {detector.update(0.25).regime for _ in range(200)}
         assert regimes == {LearningRegime.STABLE}

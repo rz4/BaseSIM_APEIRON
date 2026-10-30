@@ -50,15 +50,22 @@ from apeiron.config.configuration import DriftDetectionCfg
 from apeiron.driver.continuous_monitor import ContinuousMonitor
 
 #: Page-Hinkley at a near-zero threshold, so the CL path is exercised.
-FIRES = {"detector_name": "PageHinkleyDetector", "ph_threshold": 0.0001,
-         "ph_min_instances": 1, "ph_delta": 0.0, "detection_interval": 4,
-         "max_stream_updates": 1}
+FIRES = {
+    "detector_name": "PageHinkleyDetector",
+    "ph_threshold": 0.0001,
+    "ph_min_instances": 1,
+    "ph_delta": 0.0,
+    "detection_interval": 4,
+    "max_stream_updates": 1,
+}
 
 
 def _fixed(seed: int, n: int = 24, in_f: int = 4, nc: int = 3) -> TensorDataset:
     generator = torch.Generator().manual_seed(seed)
-    return TensorDataset(torch.randn(n, in_f, generator=generator),
-                         torch.randint(0, nc, (n,), generator=generator))
+    return TensorDataset(
+        torch.randn(n, in_f, generator=generator),
+        torch.randint(0, nc, (n,), generator=generator),
+    )
 
 
 def _steps_by_stage(default_cfg):
@@ -67,10 +74,14 @@ def _steps_by_stage(default_cfg):
 
     np.random.seed(5)
     torch.manual_seed(5)
-    cfg = replace(default_cfg,
-                  drift_detection=replace(DriftDetectionCfg(), **FIRES))
-    harness = DummyHarness(cfg, train_data=_fixed(1), val_data=_fixed(2),
-                           hist_train_data=_fixed(3), hist_val_data=_fixed(4))
+    cfg = replace(default_cfg, drift_detection=replace(DriftDetectionCfg(), **FIRES))
+    harness = DummyHarness(
+        cfg,
+        train_data=_fixed(1),
+        val_data=_fixed(2),
+        hist_train_data=_fixed(3),
+        hist_val_data=_fixed(4),
+    )
     with torch.no_grad():
         for index, parameter in enumerate(harness.model.parameters()):
             parameter.copy_(torch.full_like(parameter, 0.01 * (index + 1)))

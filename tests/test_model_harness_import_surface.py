@@ -54,8 +54,11 @@ def _cross_layer_imports(module: types.ModuleType):
     """Every `from apeiron.… import a, b` in the module, as (line, mod, names)."""
     source = pathlib.Path(module.__file__).read_text()
     for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.ImportFrom) and node.module \
-                and node.module.startswith("apeiron."):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("apeiron.")
+        ):
             yield node.lineno, node.module, [a.name for a in node.names]
 
 
@@ -90,16 +93,21 @@ def test_a_module_that_uses_torch_imports_it_itself(module):
     """
     source = pathlib.Path(module.__file__).read_text()
     tree = ast.parse(source)
-    uses_torch = any(
-        isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-        and node.value.id == "torch"
-        for node in ast.walk(tree)
-    ) or "torch." in source
+    uses_torch = (
+        any(
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "torch"
+            for node in ast.walk(tree)
+        )
+        or "torch." in source
+    )
     if not uses_torch:
         pytest.skip(f"{pathlib.Path(module.__file__).name} does not use torch")
     direct = {
         alias.name.split(".")[0]
-        for node in ast.walk(tree) if isinstance(node, ast.Import)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
         for alias in node.names
     } | {
         node.module.split(".")[0]

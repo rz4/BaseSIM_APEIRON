@@ -47,8 +47,10 @@ from apeiron.training.continuous_trainer import ContinuousTrainer
 
 def _fixed(seed: int, n: int = 32, in_f: int = 4, nc: int = 3) -> TensorDataset:
     generator = torch.Generator().manual_seed(seed)
-    return TensorDataset(torch.randn(n, in_f, generator=generator),
-                         torch.randint(0, nc, (n,), generator=generator))
+    return TensorDataset(
+        torch.randn(n, in_f, generator=generator),
+        torch.randint(0, nc, (n,), generator=generator),
+    )
 
 
 def _trainer_and_stages(cfg, harness):
@@ -71,6 +73,7 @@ def _trainer_and_stages(cfg, harness):
 
     class Recording:
         """Stands in for the module-level logger."""
+
         step = 0
 
         def stage(self, name):
@@ -80,10 +83,12 @@ def _trainer_and_stages(cfg, harness):
             return lambda *a, **kw: None
 
     injected.stage = record
-    with patch("apeiron.training.continuous_trainer.get_logger",
-               return_value=Recording()):
-        trainer = ContinuousTrainer(cfg, harness, injected,
-                                    FLOPSProfiler(warmup_iters=0))
+    with patch(
+        "apeiron.training.continuous_trainer.get_logger", return_value=Recording()
+    ):
+        trainer = ContinuousTrainer(
+            cfg, harness, injected, FLOPSProfiler(warmup_iters=0)
+        )
         trainer.outer_cl_training_loop(drift_event_id=3)
     return stages
 
@@ -115,23 +120,23 @@ class TestTheTrainerNamesItsNamespaces:
             f"stages used: {sorted(set(stages))}"
         )
 
-    def test_it_never_writes_into_the_drift_namespace(self, default_cfg,
-                                                     dummy_harness):
+    def test_it_never_writes_into_the_drift_namespace(self, default_cfg, dummy_harness):
         """The drift namespace belongs to the monitor's detection rows. A
         trainer that set it would make its training rows indistinguishable
         from drift measurements."""
         stages = _trainer_and_stages(default_cfg, dummy_harness)
         assert "drift" not in stages, (
-            "the trainer set the `drift` stage; that namespace is the "
-            "monitor's"
+            "the trainer set the `drift` stage; that namespace is the monitor's"
         )
 
     def test_it_sets_a_stage_with_history_present_too(self, default_cfg):
         """The historical-data path logs its own validation rows, and they
         belong in `eval` with the rest."""
         from conftest import DummyHarness
-        harness = DummyHarness(default_cfg, hist_train_data=_fixed(5),
-                               hist_val_data=_fixed(9))
+
+        harness = DummyHarness(
+            default_cfg, hist_train_data=_fixed(5), hist_val_data=_fixed(9)
+        )
         harness.register_task([1.0])
         stages = _trainer_and_stages(default_cfg, harness)
         assert "eval" in stages

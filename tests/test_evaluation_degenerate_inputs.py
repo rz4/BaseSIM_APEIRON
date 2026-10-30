@@ -103,7 +103,7 @@ class TestDegenerateInputRaises:
         mismatch, and that number reaches the CSV and the drift detector."""
         output = torch.zeros(2, 3, 4)
         target = torch.zeros(2, dtype=torch.long)
-        with pytest.raises(Exception):      # noqa: B017 — type is incidental
+        with pytest.raises(Exception):  # noqa: B017 — type is incidental
             accuracy(output, target)
 
     def test_an_empty_batch_raises(self):
@@ -111,13 +111,13 @@ class TestDegenerateInputRaises:
         the metric buffer's mean into the drift detector's input."""
         output = torch.zeros(0, 3)
         target = torch.zeros(0, dtype=torch.long)
-        with pytest.raises(Exception):      # noqa: B017 — type is incidental
+        with pytest.raises(Exception):  # noqa: B017 — type is incidental
             accuracy(output, target)
 
     def test_an_empty_topk_raises(self):
         """`max(())` has no answer, so there is no k to score."""
         output, target = _well_formed()
-        with pytest.raises(Exception):      # noqa: B017 — type is incidental
+        with pytest.raises(Exception):  # noqa: B017 — type is incidental
             accuracy_topk(output, target, topk=())
 
     def test_a_k_larger_than_the_class_count_raises(self):
@@ -125,5 +125,5 @@ class TestDegenerateInputRaises:
         accuracy over two classes is not 100%, it is a configuration
         error."""
         output, target = _well_formed()
-        with pytest.raises(Exception):      # noqa: B017 — type is incidental
+        with pytest.raises(Exception):  # noqa: B017 — type is incidental
             accuracy_topk(output, target, topk=(5,))

@@ -102,9 +102,7 @@ class TestSubclassState:
         for name in ("mean", "median", "last"):
             cfg = replace(
                 default_cfg,
-                drift_detection=replace(
-                    default_cfg.drift_detection, aggregation=name
-                ),
+                drift_detection=replace(default_cfg.drift_detection, aggregation=name),
             )
             assert _monitor(cfg, dummy_harness).aggregation == name
 
@@ -113,8 +111,9 @@ class TestAggregateBufferSeam:
     """`cl_only.py` calls this by name, so the name is part of the contract."""
 
     def test_is_callable(self, default_cfg, dummy_harness):
-        assert callable(getattr(_monitor(default_cfg, dummy_harness),
-                                "_aggregate_buffer", None))
+        assert callable(
+            getattr(_monitor(default_cfg, dummy_harness), "_aggregate_buffer", None)
+        )
 
     @pytest.mark.parametrize(
         ("aggregation", "expected"),
@@ -138,8 +137,7 @@ class TestAggregateBufferSeam:
         assert mon._aggregate_buffer() == pytest.approx(expected)
 
     @pytest.mark.parametrize("aggregation", ["mien", "MEAN", "average", "max", ""])
-    def test_anything_else_is_refused(self, default_cfg, dummy_harness,
-                                      aggregation):
+    def test_anything_else_is_refused(self, default_cfg, dummy_harness, aggregation):
         """Changed from A20's pinned fallback: these used to silently become
         the mean, so a typo monitored a different quantity than asked. Note
         the case folding: "MEAN" is refused too -- the names are exact."""
@@ -191,8 +189,7 @@ class TestAdaptSeam:
     """`_adapt(event_id)` is documented as the scheduled-adaptation seam."""
 
     def test_is_callable(self, default_cfg, dummy_harness):
-        assert callable(getattr(_monitor(default_cfg, dummy_harness),
-                                "_adapt", None))
+        assert callable(getattr(_monitor(default_cfg, dummy_harness), "_adapt", None))
 
     def test_dispatches_the_outer_cl_loop_with_the_event_id(
         self, default_cfg, dummy_harness

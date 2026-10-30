@@ -142,8 +142,7 @@ class BaseDriftDetector(ABC):
         missing = [attr for attr in attrs if attr not in state]
         if missing:
             raise KeyError(
-                f"checkpoint for {type(self).__name__} is missing "
-                f"{', '.join(missing)}"
+                f"checkpoint for {type(self).__name__} is missing {', '.join(missing)}"
             )
         for attr in attrs:
             setattr(self, attr, copy.deepcopy(state[attr]))

@@ -51,14 +51,17 @@ from apeiron.training.continuous_trainer import ContinuousTrainer
 @pytest.fixture()
 def trainer(default_cfg, dummy_harness) -> ContinuousTrainer:
     return ContinuousTrainer(
-        default_cfg, dummy_harness, Logger(backend="none"),
+        default_cfg,
+        dummy_harness,
+        Logger(backend="none"),
         FLOPSProfiler(warmup_iters=0),
     )
 
 
 def _loader(rows: int, batch: int, features: int = 4) -> DataLoader:
-    data = TensorDataset(torch.randn(rows, features),
-                         torch.zeros(rows, dtype=torch.long))
+    data = TensorDataset(
+        torch.randn(rows, features), torch.zeros(rows, dtype=torch.long)
+    )
     return DataLoader(data, batch_size=batch)
 
 
@@ -130,6 +133,7 @@ class TestShortWindowIsRefused:
         `AttributeError: 'str' object has no attribute 'shape'` -- which
         names the wrong problem and points the operator at the batch
         instead of at the window size."""
+
         class Odd:
             def __iter__(self):
                 return iter([(torch.zeros(1, 4), "not-a-tensor")])

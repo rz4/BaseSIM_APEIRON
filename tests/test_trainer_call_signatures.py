@@ -35,7 +35,11 @@ from apeiron.training.continuous_trainer import ContinuousTrainer
 
 #: method -> (owner, ordered parameter names after self, names with defaults)
 CALLED_ACROSS_LAYERS = {
-    'ContinuousTrainer.outer_cl_training_loop': (ContinuousTrainer, ['drift_event_id'], ['drift_event_id']),
+    "ContinuousTrainer.outer_cl_training_loop": (
+        ContinuousTrainer,
+        ["drift_event_id"],
+        ["drift_event_id"],
+    ),
 }
 
 
@@ -44,12 +48,12 @@ def test_the_parameters_a_caller_passes_are_there(label):
     owner, expected, _defaults = CALLED_ACROSS_LAYERS[label]
     method = getattr(owner, label.split(".", 1)[1])
     params = [
-        name for name, p in inspect.signature(method).parameters.items()
+        name
+        for name, p in inspect.signature(method).parameters.items()
         if name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
     ]
     assert params == list(expected), (
-        f"{label} takes {params}; callers in other layers pass "
-        f"{list(expected)}"
+        f"{label} takes {params}; callers in other layers pass {list(expected)}"
     )
 
 
@@ -61,7 +65,8 @@ def test_the_optional_parameters_stay_optional(label):
     method = getattr(owner, label.split(".", 1)[1])
     params = inspect.signature(method).parameters
     missing = [
-        name for name in defaults
+        name
+        for name in defaults
         if name not in params or params[name].default is inspect.Parameter.empty
     ]
     assert not missing, f"{label} made {missing} required"

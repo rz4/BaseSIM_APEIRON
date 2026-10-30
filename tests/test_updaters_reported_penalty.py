@@ -38,10 +38,12 @@ MODES = ("base", "jvp_reg", "ewc_online", "kfac_online", "none")
 
 def _updater(default_cfg, dummy_harness, mode: str, mix: bool):
     from dataclasses import replace
+
     cfg = replace(
         default_cfg,
-        continual_learning=replace(default_cfg.continual_learning,
-                                   update_mode=mode, mix_historic_data=mix),
+        continual_learning=replace(
+            default_cfg.continual_learning, update_mode=mode, mix_historic_data=mix
+        ),
     )
     return cfg, create_updater(cfg, dummy_harness)
 
@@ -56,7 +58,7 @@ class TestNoHistoryMeansNoPenalty:
     ):
         _cfg, updater = _updater(default_cfg, dummy_harness, mode, mix)
         batch = next(iter(dummy_harness.get_train_dataloaders()[0]))
-        updater.fwd_bwd(batch)                 # no historical batch supplied
+        updater.fwd_bwd(batch)  # no historical batch supplied
         assert float(updater.update_post_fwd_bwd()) == pytest.approx(0.0)
 
     @pytest.mark.parametrize("mode", MODES)

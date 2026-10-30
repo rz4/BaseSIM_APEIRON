@@ -31,7 +31,18 @@ import types
 import pytest
 
 #: Measured from `src/`. Every name a sibling layer may import from here.
-EXPECTED = {'ConsoleLogger', 'MetricsBackend', 'configure_backend', 'get_logger', 'reset_logger', 'VALID_STAGES', 'WandBLogger', 'Logger', 'StageType', 'MLFlowLogger'}
+EXPECTED = {
+    "ConsoleLogger",
+    "MetricsBackend",
+    "configure_backend",
+    "get_logger",
+    "reset_logger",
+    "VALID_STAGES",
+    "WandBLogger",
+    "Logger",
+    "StageType",
+    "MLFlowLogger",
+}
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +53,8 @@ def package() -> types.ModuleType:
 def _public_names(module: types.ModuleType) -> set[str]:
     """Public, non-module attributes -- submodules are not the API."""
     return {
-        name for name in dir(module)
+        name
+        for name in dir(module)
         if not name.startswith("_")
         and not isinstance(getattr(module, name), types.ModuleType)
     }

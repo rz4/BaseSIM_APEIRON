@@ -99,8 +99,7 @@ class TestNoneBackendStaysNone:
 
     @pytest.mark.parametrize(
         "kwargs",
-        [{"prefix": False}, {"increment": False}, {"commit": False},
-         {"step": 3}],
+        [{"prefix": False}, {"increment": False}, {"commit": False}, {"step": 3}],
     )
     def test_it_is_still_none_after_logging_with_any_keyword(self, kwargs):
         logger = _none_logger()

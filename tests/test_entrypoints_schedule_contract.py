@@ -77,8 +77,13 @@ class TestParserDefaults:
 
     @pytest.mark.parametrize(
         ("name", "expected"),
-        [("period", 0), ("budget", 0), ("horizon", 0), ("prob", 0.0),
-         ("trigger_at", "")],
+        [
+            ("period", 0),
+            ("budget", 0),
+            ("horizon", 0),
+            ("prob", 0.0),
+            ("trigger_at", ""),
+        ],
     )
     def test_the_numeric_defaults_are_zero_not_none(self, name, expected):
         args = build_parser().parse_args([])
@@ -113,16 +118,17 @@ class TestRandomScheduleProb:
     def test_different_seeds_give_different_patterns(self):
         """A null whose variance is zero is not a null. One rebuild
         produced the same pattern for every seed."""
-        assert pattern(RandomSchedule(seed=0, prob=0.5)) != \
-            pattern(RandomSchedule(seed=1, prob=0.5))
+        assert pattern(RandomSchedule(seed=0, prob=0.5)) != pattern(
+            RandomSchedule(seed=1, prob=0.5)
+        )
 
     def test_the_same_seed_repeats(self):
-        assert pattern(RandomSchedule(seed=3, prob=0.5)) == \
-            pattern(RandomSchedule(seed=3, prob=0.5))
+        assert pattern(RandomSchedule(seed=3, prob=0.5)) == pattern(
+            RandomSchedule(seed=3, prob=0.5)
+        )
 
     def test_describe_names_the_probability(self):
-        assert RandomSchedule(seed=1, prob=0.5).describe() == \
-            "random(seed=1, p=0.5)"
+        assert RandomSchedule(seed=1, prob=0.5).describe() == "random(seed=1, p=0.5)"
 
 
 class TestRandomScheduleBudget:
@@ -148,8 +154,10 @@ class TestRandomScheduleBudget:
             assert pattern(schedule).count("#") == 7
 
     def test_describe_lists_the_chosen_windows(self):
-        assert RandomSchedule(seed=0, budget=3, horizon=HORIZON).describe() == \
-            "random(seed=0, exactly 3 of 24: [12,14,18])"
+        assert (
+            RandomSchedule(seed=0, budget=3, horizon=HORIZON).describe()
+            == "random(seed=0, exactly 3 of 24: [12,14,18])"
+        )
 
 
 class TestRandomScheduleRefusals:
@@ -208,26 +216,28 @@ class TestMakeSchedule:
         the one the module documents as preferred, because it holds the
         adaptation count fixed and varies only the placement."""
         schedule = make_schedule(
-            self._args(schedule="periodic", period=0, budget=budget,
-                       horizon=HORIZON), cfg)
+            self._args(schedule="periodic", period=0, budget=budget, horizon=HORIZON),
+            cfg,
+        )
         assert schedule.period == period
         assert pattern(schedule) == expected
 
     def test_periodic_needs_one_of_the_two(self, cfg):
         with pytest.raises(ValueError):
-            make_schedule(self._args(schedule="periodic", period=0, budget=0),
-                          cfg)
+            make_schedule(self._args(schedule="periodic", period=0, budget=0), cfg)
 
     def test_a_non_positive_horizon_falls_back_to_the_config(self, cfg):
         """The CLI defaults `--horizon` to 0, so this fallback is the normal
         path. Both rebuilds raised instead."""
         schedule = make_schedule(
-            self._args(schedule="random", horizon=0, budget=3), cfg)
+            self._args(schedule="random", horizon=0, budget=3), cfg
+        )
         assert pattern(schedule).count("#") <= 3
 
     def test_the_schedule_seed_overrides_the_config_seed(self, cfg):
         with_seed = make_schedule(
-            self._args(schedule="random", prob=0.5, schedule_seed=7), cfg)
+            self._args(schedule="random", prob=0.5, schedule_seed=7), cfg
+        )
         assert pattern(with_seed) == pattern(RandomSchedule(seed=7, prob=0.5))
 
     def test_fixed_needs_its_trigger_list(self, cfg):
@@ -235,8 +245,7 @@ class TestMakeSchedule:
             make_schedule(self._args(schedule="fixed", trigger_at=""), cfg)
 
     def test_fixed_fires_exactly_where_told(self, cfg):
-        schedule = make_schedule(
-            self._args(schedule="fixed", trigger_at="1,2,3"), cfg)
+        schedule = make_schedule(self._args(schedule="fixed", trigger_at="1,2,3"), cfg)
         assert isinstance(schedule, FixedSchedule)
         assert pattern(schedule, 6) == ".###.."
 
@@ -257,6 +266,7 @@ class TestMainSignature:
         documentation of what `main` may be handed.
         """
         import inspect
+
         signature = inspect.signature(cl_only.main)
         assert "argv" in signature.parameters
         assert signature.return_annotation is not inspect.Signature.empty

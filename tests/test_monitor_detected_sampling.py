@@ -42,18 +42,24 @@ from apeiron.drift_detection.detectors.base import DriftSignal, LearningRegime
 from apeiron.driver.continuous_monitor import ContinuousMonitor
 
 
-def _rows_with_detected(cfg, harness, *, checks: int, seed: int,
-                        always_fire: bool = False) -> tuple[int, int]:
+def _rows_with_detected(
+    cfg, harness, *, checks: int, seed: int, always_fire: bool = False
+) -> tuple[int, int]:
     """(rows carrying `detected`, total drift rows) over `checks` checks."""
     np.random.seed(seed)
     monitor = ContinuousMonitor(cfg=cfg, modelHarness=harness)
 
     if always_fire:
+
         class AlwaysFires:
             def update(self, value, **kwargs):
-                return DriftSignal(regime=LearningRegime.CONTINUAL_LEARNING,
-                                   drift_detected=True, drift_score=1.0,
-                                   confidence=0.5, metadata={})
+                return DriftSignal(
+                    regime=LearningRegime.CONTINUAL_LEARNING,
+                    drift_detected=True,
+                    drift_score=1.0,
+                    confidence=0.5,
+                    metadata={},
+                )
 
             def reset(self):
                 pass
@@ -73,7 +79,7 @@ def _rows_with_detected(cfg, harness, *, checks: int, seed: int,
         monitor.metric_buffer = [[1.0, 2.0]]
         try:
             monitor._check_drift()
-        except Exception:                 # noqa: BLE001 — adaptation is not under test
+        except Exception:  # noqa: BLE001 — adaptation is not under test
             break
     return counts["detected"], counts["total"]
 
@@ -86,7 +92,8 @@ class TestANonEventIsSampled:
         """The whole finding: a rebuild wrote it on all of them, and the
         extra rows shifted every later step label."""
         detected, total = _rows_with_detected(
-            default_cfg, dummy_harness, checks=40, seed=seed)
+            default_cfg, dummy_harness, checks=40, seed=seed
+        )
         assert total == 40, f"expected 40 drift rows, got {total}"
         assert detected < total, (
             f"`detected` was written on all {total} checks; it is sampled "
@@ -95,28 +102,25 @@ class TestANonEventIsSampled:
         )
 
     @pytest.mark.parametrize("seed", [0, 1, 42])
-    def test_the_sampled_share_is_about_a_tenth(self, default_cfg,
-                                               dummy_harness, seed):
+    def test_the_sampled_share_is_about_a_tenth(self, default_cfg, dummy_harness, seed):
         """`<= 0.1` against a uniform draw. Asserted as a band rather than
         an exact count so the case does not depend on numpy's stream
         staying byte-identical across versions, while still refusing both
         'never' and 'always'."""
         detected, total = _rows_with_detected(
-            default_cfg, dummy_harness, checks=200, seed=seed)
+            default_cfg, dummy_harness, checks=200, seed=seed
+        )
         assert 0 < detected <= total * 0.25, (
             f"{detected} of {total} non-events carried `detected`; expected "
             f"roughly a tenth"
         )
 
-    def test_the_same_seed_gives_the_same_count(self, default_cfg,
-                                                dummy_harness):
+    def test_the_same_seed_gives_the_same_count(self, default_cfg, dummy_harness):
         """It draws from the global numpy RNG, so a seeded run is
         reproducible -- which is the only reason the MNIST claim can pin a
         digest over these rows at all."""
-        first = _rows_with_detected(default_cfg, dummy_harness,
-                                    checks=60, seed=7)
-        second = _rows_with_detected(default_cfg, dummy_harness,
-                                     checks=60, seed=7)
+        first = _rows_with_detected(default_cfg, dummy_harness, checks=60, seed=7)
+        second = _rows_with_detected(default_cfg, dummy_harness, checks=60, seed=7)
         assert first == second
 
 
@@ -124,13 +128,15 @@ class TestARealEventIsNeverDropped:
     """The half that must not be sampled."""
 
     @pytest.mark.parametrize("seed", [0, 1, 42])
-    def test_every_firing_check_carries_detected(self, default_cfg,
-                                                 dummy_harness, seed):
-        """"always included so no true drift events are dropped". With a
+    def test_every_firing_check_carries_detected(
+        self, default_cfg, dummy_harness, seed
+    ):
+        """ "always included so no true drift events are dropped". With a
         detector that fires on every check, every row must have it --
         whatever the sampling draw would have said."""
         detected, total = _rows_with_detected(
-            default_cfg, dummy_harness, checks=5, seed=seed, always_fire=True)
+            default_cfg, dummy_harness, checks=5, seed=seed, always_fire=True
+        )
         assert total > 0, "no drift row was logged"
         assert detected == total, (
             f"only {detected} of {total} FIRING checks carried `detected`; "

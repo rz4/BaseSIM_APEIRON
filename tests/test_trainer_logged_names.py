@@ -50,8 +50,11 @@ from apeiron.profilers.count_flops import FLOPSProfiler
 from apeiron.training.continuous_trainer import ContinuousTrainer
 
 #: The loss columns, written under the `cl` stage for every update mode.
-LOSS_NAMES = {"jvp_reg_total_loss", "jvp_reg_forgetting_loss",
-              "jvp_reg_generation_loss"}
+LOSS_NAMES = {
+    "jvp_reg_total_loss",
+    "jvp_reg_forgetting_loss",
+    "jvp_reg_generation_loss",
+}
 
 #: Profiler tags, which become `cperf_{tag}_{flop,time,flops}` columns.
 PROFILER_TAGS = {"update_fwd_bwd", "optimizer"}
@@ -59,8 +62,10 @@ PROFILER_TAGS = {"update_fwd_bwd", "optimizer"}
 
 def _fixed(seed: int, n: int = 32, in_f: int = 4, nc: int = 3) -> TensorDataset:
     generator = torch.Generator().manual_seed(seed)
-    return TensorDataset(torch.randn(n, in_f, generator=generator),
-                         torch.randint(0, nc, (n,), generator=generator))
+    return TensorDataset(
+        torch.randn(n, in_f, generator=generator),
+        torch.randint(0, nc, (n,), generator=generator),
+    )
 
 
 def _run_and_collect(cfg, harness):
@@ -102,8 +107,9 @@ def _run_and_collect(cfg, harness):
     profiler.measure_flops = measure
     profiler.measure_flops_optimizer = measure_optimizer
 
-    with patch("apeiron.training.continuous_trainer.get_logger",
-               return_value=Recording()):
+    with patch(
+        "apeiron.training.continuous_trainer.get_logger", return_value=Recording()
+    ):
         trainer = ContinuousTrainer(cfg, harness, injected, profiler)
         trainer.outer_cl_training_loop(drift_event_id=3)
     return names, tags
@@ -112,30 +118,36 @@ def _run_and_collect(cfg, harness):
 @pytest.fixture()
 def harness_with_history(default_cfg):
     from conftest import DummyHarness
-    harness = DummyHarness(default_cfg, hist_train_data=_fixed(5),
-                           hist_val_data=_fixed(9))
+
+    harness = DummyHarness(
+        default_cfg, hist_train_data=_fixed(5), hist_val_data=_fixed(9)
+    )
     harness.register_task([1.0])
     return harness
 
 
 class TestTheLossColumnNames:
-    def test_the_loss_columns_use_the_jvp_reg_prefix(self, default_cfg,
-                                                    harness_with_history):
+    def test_the_loss_columns_use_the_jvp_reg_prefix(
+        self, default_cfg, harness_with_history
+    ):
         """Hard-coded, and pinned because the record depends on it. See
         A69 for the case that it should follow `update_mode` instead."""
         names, _tags = _run_and_collect(default_cfg, harness_with_history)
         missing = sorted(LOSS_NAMES - names)
         assert not missing, f"the CL rows are missing {missing}"
 
-    def test_the_prefix_does_not_follow_the_update_mode(self, default_cfg,
-                                                       harness_with_history):
+    def test_the_prefix_does_not_follow_the_update_mode(
+        self, default_cfg, harness_with_history
+    ):
         """The surprising half, stated so a reconstruction cannot
         'improve' it without the gate noticing."""
         from dataclasses import replace
+
         cfg = replace(
             default_cfg,
-            continual_learning=replace(default_cfg.continual_learning,
-                                       update_mode="kfac_online"),
+            continual_learning=replace(
+                default_cfg.continual_learning, update_mode="kfac_online"
+            ),
         )
         names, _tags = _run_and_collect(cfg, harness_with_history)
         assert "jvp_reg_total_loss" in names
@@ -143,31 +155,33 @@ class TestTheLossColumnNames:
 
 
 class TestTheProfilerTags:
-    def test_the_measured_tags_are_the_documented_ones(self, default_cfg,
-                                                       harness_with_history):
+    def test_the_measured_tags_are_the_documented_ones(
+        self, default_cfg, harness_with_history
+    ):
         """These become `cperf_{tag}_*` columns, which `docs/profiler.md`
         and the determinism filter both match on."""
         _names, tags = _run_and_collect(default_cfg, harness_with_history)
         missing = sorted(PROFILER_TAGS - tags)
         assert not missing, f"the loop never measured under {missing}"
 
-    def test_no_abbreviated_tag_is_used(self, default_cfg,
-                                        harness_with_history):
+    def test_no_abbreviated_tag_is_used(self, default_cfg, harness_with_history):
         _names, tags = _run_and_collect(default_cfg, harness_with_history)
         assert "fwd_bwd" not in tags
         assert "opt" not in tags
 
 
 class TestValidationIsLoggedOnce:
-    def test_the_post_round_validation_is_recorded(self, default_cfg,
-                                                   harness_with_history):
+    def test_the_post_round_validation_is_recorded(
+        self, default_cfg, harness_with_history
+    ):
         names, _tags = _run_and_collect(default_cfg, harness_with_history)
         assert [n for n in names if n.startswith("val_post_")], (
             "the post-CL validation was not recorded"
         )
 
-    def test_no_pre_round_validation_set_is_written(self, default_cfg,
-                                                   harness_with_history):
+    def test_no_pre_round_validation_set_is_written(
+        self, default_cfg, harness_with_history
+    ):
         """`_log_validation` is called once, with `"post"`. The pre-CL
         figure is already recorded as `test_pre_cl_acc`, so a second
         `val_pre_*` set duplicates it under another scheme and adds four

@@ -74,8 +74,9 @@ def tiny() -> Tiny:
     return Tiny()
 
 
-def _measured(model: Tiny, batch: int = 2, tag: str = "fwd",
-              times: int = 1) -> FLOPSProfiler:
+def _measured(
+    model: Tiny, batch: int = 2, tag: str = "fwd", times: int = 1
+) -> FLOPSProfiler:
     profiler = FLOPSProfiler(warmup_iters=0)
     x = torch.ones(batch, 8)
     for _ in range(times):
@@ -98,8 +99,11 @@ class TestReportedKeys:
             with profiler.measure_flops(tag):
                 tiny(x)
         assert set(profiler.get_performance()) == {
-            "infer_flop", "infer_time", "infer_flops",
-            "update_fwd_bwd_flop", "update_fwd_bwd_time",
+            "infer_flop",
+            "infer_time",
+            "infer_flops",
+            "update_fwd_bwd_flop",
+            "update_fwd_bwd_time",
             "update_fwd_bwd_flops",
         }
 
@@ -120,9 +124,7 @@ class TestReportedValues:
         ("batch", "expected"),
         [(1, 384.0), (2, 768.0), (4, 1536.0), (8, 3072.0)],
     )
-    def test_flop_count_is_exact_and_scales_with_the_batch(
-        self, tiny, batch, expected
-    ):
+    def test_flop_count_is_exact_and_scales_with_the_batch(self, tiny, batch, expected):
         perf = _measured(tiny, batch=batch).get_performance()
         assert perf["fwd_flop"] == expected
 
@@ -132,9 +134,7 @@ class TestReportedValues:
         The duration is not asserted (it is a clock) but the relationship
         between the three is."""
         perf = _measured(tiny).get_performance()
-        assert perf["fwd_flops"] == pytest.approx(
-            perf["fwd_flop"] / perf["fwd_time"]
-        )
+        assert perf["fwd_flops"] == pytest.approx(perf["fwd_flop"] / perf["fwd_time"])
 
     def test_repeated_measurement_averages_rather_than_replaces(self, tiny):
         """Three identical passes report the same figure one does, so the
@@ -161,8 +161,10 @@ class TestFailedMeasurement:
 
     def test_the_exception_propagates(self, tiny):
         profiler = FLOPSProfiler(warmup_iters=0)
-        with pytest.raises(RuntimeError, match="planted"), \
-                profiler.measure_flops("boom"):
+        with (
+            pytest.raises(RuntimeError, match="planted"),
+            profiler.measure_flops("boom"),
+        ):
             raise RuntimeError("planted")
 
     def test_the_tag_is_released(self, tiny):

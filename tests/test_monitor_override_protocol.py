@@ -78,19 +78,26 @@ from apeiron.driver.continuous_monitor import ContinuousMonitor
 def _patch_logger():
     mock_logger = MagicMock()
     mock_logger.step = 0
-    with patch("apeiron.driver.continuous_monitor.get_logger",
-               return_value=mock_logger):
-        with patch("apeiron.training.continuous_trainer.get_logger",
-                   return_value=mock_logger):
+    with patch(
+        "apeiron.driver.continuous_monitor.get_logger", return_value=mock_logger
+    ):
+        with patch(
+            "apeiron.training.continuous_trainer.get_logger", return_value=mock_logger
+        ):
             yield mock_logger
 
 
 def _quiet_cfg(default_cfg, **drift):
     """A config that checks drift often and extends the stream twice."""
-    return replace(default_cfg,
-                   drift_detection=replace(default_cfg.drift_detection,
-                                           detection_interval=1,
-                                           max_stream_updates=2, **drift))
+    return replace(
+        default_cfg,
+        drift_detection=replace(
+            default_cfg.drift_detection,
+            detection_interval=1,
+            max_stream_updates=2,
+            **drift,
+        ),
+    )
 
 
 def _ckpt_cfg(default_cfg, tmp_path, *, keep: int):
@@ -102,9 +109,12 @@ def _ckpt_cfg(default_cfg, tmp_path, *, keep: int):
     and the guard below caught it -- which is the only reason the cases
     are not quietly vacuous.
     """
-    return replace(default_cfg,
-                   model=replace(default_cfg.model, max_ckpts=keep,
-                                 ckpts_path=str(tmp_path / "ckpts")))
+    return replace(
+        default_cfg,
+        model=replace(
+            default_cfg.model, max_ckpts=keep, ckpts_path=str(tmp_path / "ckpts")
+        ),
+    )
 
 
 class _Recording(ContinuousMonitor):
@@ -136,13 +146,11 @@ class _WindowRaises(ContinuousMonitor):
 
 
 class TestTheLogMetricsSeamTakesTheAggregate:
-    def test_a_two_parameter_override_is_callable(self, default_cfg,
-                                                  dummy_harness):
+    def test_a_two_parameter_override_is_callable(self, default_cfg, dummy_harness):
         """The whole finding. `drift_only.py` and `cl_only.py` both define
         `_log_metrics(self, drift_signal, metric_value)`; a base class that
         calls it with one argument raises TypeError on every drift check."""
-        monitor = _Recording(cfg=_quiet_cfg(default_cfg),
-                             modelHarness=dummy_harness)
+        monitor = _Recording(cfg=_quiet_cfg(default_cfg), modelHarness=dummy_harness)
         monitor.run()
         assert monitor.logged, (
             "the override was never called, so this case proves nothing -- "
@@ -156,8 +164,7 @@ class TestTheLogMetricsSeamTakesTheAggregate:
         the detector was updated with. `drift_only.py` logs it as
         `metric_{self.metric_idx}`, so a different value would mislabel
         the column rather than fail."""
-        monitor = _Recording(cfg=_quiet_cfg(default_cfg),
-                             modelHarness=dummy_harness)
+        monitor = _Recording(cfg=_quiet_cfg(default_cfg), modelHarness=dummy_harness)
         monitor.run()
         assert monitor.logged
         for _signal, value in monitor.logged:
@@ -173,8 +180,7 @@ class TestTheLogMetricsSeamTakesTheAggregate:
         )
 
     def test_the_signal_is_passed_too(self, default_cfg, dummy_harness):
-        monitor = _Recording(cfg=_quiet_cfg(default_cfg),
-                             modelHarness=dummy_harness)
+        monitor = _Recording(cfg=_quiet_cfg(default_cfg), modelHarness=dummy_harness)
         monitor.run()
         signal, _value = monitor.logged[-1]
         assert hasattr(signal, "drift_detected"), (
@@ -184,23 +190,21 @@ class TestTheLogMetricsSeamTakesTheAggregate:
 
 
 class TestAWindowMayEndByRaising:
-    def test_stop_iteration_from_the_override_is_caught(self, default_cfg,
-                                                        dummy_harness):
+    def test_stop_iteration_from_the_override_is_caught(
+        self, default_cfg, dummy_harness
+    ):
         """`cl_only.py:277` raises `StopIteration` once its window is done,
         documented in its own docstring as "Always, once the window is
         exhausted, to hand control back to run()". If `run()` does not
         catch it, every scheduled-CL run dies on its first window."""
-        monitor = _WindowRaises(cfg=_quiet_cfg(default_cfg),
-                                modelHarness=dummy_harness)
-        monitor.run()          # must not propagate
+        monitor = _WindowRaises(cfg=_quiet_cfg(default_cfg), modelHarness=dummy_harness)
+        monitor.run()  # must not propagate
         assert monitor.windows > 0, "the override never ran"
 
-    def test_each_raise_still_extends_the_stream(self, default_cfg,
-                                                 dummy_harness):
+    def test_each_raise_still_extends_the_stream(self, default_cfg, dummy_harness):
         """Caught, not swallowed: the loop has to make progress or it
         spins forever on a window that always raises."""
-        monitor = _WindowRaises(cfg=_quiet_cfg(default_cfg),
-                                modelHarness=dummy_harness)
+        monitor = _WindowRaises(cfg=_quiet_cfg(default_cfg), modelHarness=dummy_harness)
         monitor.run()
         assert monitor.stream_update_count >= monitor.max_stream_updates, (
             f"the run stopped after {monitor.stream_update_count} stream "
@@ -240,8 +244,7 @@ class TestAdaptingCheckpoints:
     the detail the two paths disagree about.
     """
 
-    def test_adapt_writes_a_checkpoint(self, default_cfg, make_harness,
-                                       tmp_path):
+    def test_adapt_writes_a_checkpoint(self, default_cfg, make_harness, tmp_path):
         """The whole finding, reached the way `cl_only.py` reaches it."""
         cfg = _ckpt_cfg(default_cfg, tmp_path, keep=2)
         monitor = ContinuousMonitor(cfg=cfg, modelHarness=make_harness(cfg))
@@ -250,16 +253,18 @@ class TestAdaptingCheckpoints:
             "pass on a monitor that never saves"
         )
         monitor._adapt(7)
-        written = sorted(p.name for p in
-                         (tmp_path / "ckpts").glob("drift_adaptation_*.pt"))
+        written = sorted(
+            p.name for p in (tmp_path / "ckpts").glob("drift_adaptation_*.pt")
+        )
         assert written, (
             "`_adapt` trained but wrote no checkpoint; a subclass that "
             "adapts on a schedule calls only this and would never persist "
             "the model it just trained"
         )
 
-    def test_the_checkpoint_is_named_for_the_argument(self, default_cfg,
-                                                      make_harness, tmp_path):
+    def test_the_checkpoint_is_named_for_the_argument(
+        self, default_cfg, make_harness, tmp_path
+    ):
         """Not for the monitor's own drift counter. `cl_only.py` passes its
         `trigger_count`, and a save keyed on `drift_event_count` would name
         every scheduled checkpoint `_0` and evict the one before it."""
@@ -267,16 +272,18 @@ class TestAdaptingCheckpoints:
         monitor = ContinuousMonitor(cfg=cfg, modelHarness=make_harness(cfg))
         for event in (3, 4):
             monitor._adapt(event)
-        written = sorted(p.name for p in
-                         (tmp_path / "ckpts").glob("drift_adaptation_*.pt"))
+        written = sorted(
+            p.name for p in (tmp_path / "ckpts").glob("drift_adaptation_*.pt")
+        )
         assert written == ["drift_adaptation_3.pt", "drift_adaptation_4.pt"], (
             f"two adaptations at events 3 and 4 wrote {written}; the file "
             f"name has to follow the event id `_adapt` was given, since "
             f"the monitor's own counter does not move on the schedule path"
         )
 
-    def test_no_checkpoint_when_checkpointing_is_off(self, default_cfg,
-                                                     make_harness, tmp_path):
+    def test_no_checkpoint_when_checkpointing_is_off(
+        self, default_cfg, make_harness, tmp_path
+    ):
         """Guard, and the other direction: `ckpts_enabled` is consulted,
         so a monitor that always saves fails here."""
         cfg = _ckpt_cfg(default_cfg, tmp_path, keep=0)
@@ -292,20 +299,20 @@ class TestTheFixtureCouldHaveFailed:
     """Guards, because both cases above pass trivially on a monitor that
     never reaches a drift check or never loops."""
 
-    def test_the_base_class_reaches_a_drift_check(self, default_cfg,
-                                                  dummy_harness):
-        monitor = ContinuousMonitor(cfg=_quiet_cfg(default_cfg),
-                                    modelHarness=dummy_harness)
+    def test_the_base_class_reaches_a_drift_check(self, default_cfg, dummy_harness):
+        monitor = ContinuousMonitor(
+            cfg=_quiet_cfg(default_cfg), modelHarness=dummy_harness
+        )
         monitor.run()
         assert monitor.check_count > 0, (
             "no drift check happened, so `_log_metrics` would never be "
             "called whatever its signature"
         )
 
-    def test_the_base_class_loops_more_than_once(self, default_cfg,
-                                                 dummy_harness):
-        monitor = ContinuousMonitor(cfg=_quiet_cfg(default_cfg),
-                                    modelHarness=dummy_harness)
+    def test_the_base_class_loops_more_than_once(self, default_cfg, dummy_harness):
+        monitor = ContinuousMonitor(
+            cfg=_quiet_cfg(default_cfg), modelHarness=dummy_harness
+        )
         monitor.run()
         assert monitor.stream_update_count >= 2, (
             "the loop ran once, so a `run()` that mishandles the second "

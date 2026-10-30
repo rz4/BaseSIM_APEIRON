@@ -35,11 +35,15 @@ from apeiron.logger.logger import Logger
 
 #: method -> (owner, ordered parameter names after self, names with defaults)
 CALLED_ACROSS_LAYERS = {
-    'Logger.log': (Logger, ['metrics', 'step', 'commit', 'prefix', 'increment'], ['step', 'commit', 'prefix', 'increment']),
-    'Logger.stage': (Logger, ['name'], []),
-    'Logger.info': (Logger, ['msg', 'level'], ['level']),
-    'Logger.finish': (Logger, ['exit_code', 'save_csv'], ['exit_code', 'save_csv']),
-    'Logger.to_csv': (Logger, ['csv_path'], ['csv_path']),
+    "Logger.log": (
+        Logger,
+        ["metrics", "step", "commit", "prefix", "increment"],
+        ["step", "commit", "prefix", "increment"],
+    ),
+    "Logger.stage": (Logger, ["name"], []),
+    "Logger.info": (Logger, ["msg", "level"], ["level"]),
+    "Logger.finish": (Logger, ["exit_code", "save_csv"], ["exit_code", "save_csv"]),
+    "Logger.to_csv": (Logger, ["csv_path"], ["csv_path"]),
 }
 
 
@@ -48,12 +52,12 @@ def test_the_parameters_a_caller_passes_are_there(label):
     owner, expected, _defaults = CALLED_ACROSS_LAYERS[label]
     method = getattr(owner, label.split(".", 1)[1])
     params = [
-        name for name, p in inspect.signature(method).parameters.items()
+        name
+        for name, p in inspect.signature(method).parameters.items()
         if name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
     ]
     assert params == list(expected), (
-        f"{label} takes {params}; callers in other layers pass "
-        f"{list(expected)}"
+        f"{label} takes {params}; callers in other layers pass {list(expected)}"
     )
 
 
@@ -65,7 +69,8 @@ def test_the_optional_parameters_stay_optional(label):
     method = getattr(owner, label.split(".", 1)[1])
     params = inspect.signature(method).parameters
     missing = [
-        name for name in defaults
+        name
+        for name in defaults
         if name not in params or params[name].default is inspect.Parameter.empty
     ]
     assert not missing, f"{label} made {missing} required"

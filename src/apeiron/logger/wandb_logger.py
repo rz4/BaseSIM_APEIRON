@@ -132,7 +132,9 @@ class WandBLogger:
             self.run.define_metric("*", step_metric="step")
         return self.run
 
-    def finish(self, exit_code: int | None = None, save_csv: bool = True) -> Path | None:
+    def finish(
+        self, exit_code: int | None = None, save_csv: bool = True
+    ) -> Path | None:
         """Close the run, optionally writing the CSV first.
 
         Returns

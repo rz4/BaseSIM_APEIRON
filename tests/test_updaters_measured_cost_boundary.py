@@ -69,8 +69,10 @@ TRAINING_MODES = ("base", "jvp_reg", "ewc_online", "kfac_online")
 
 def _conv_data(seed: int, n: int = 16) -> TensorDataset:
     generator = torch.Generator().manual_seed(seed)
-    return TensorDataset(torch.randn(n, 1, 8, 8, generator=generator),
-                         torch.randint(0, 3, (n,), generator=generator))
+    return TensorDataset(
+        torch.randn(n, 1, 8, 8, generator=generator),
+        torch.randint(0, 3, (n,), generator=generator),
+    )
 
 
 def _split(default_cfg, make_harness, tiny_cnn_factory, mode: str) -> tuple[int, int]:
@@ -80,11 +82,13 @@ def _split(default_cfg, make_harness, tiny_cnn_factory, mode: str) -> tuple[int,
     ones that reach the metrics file.
     """
     torch.manual_seed(0)
-    cfg = replace(default_cfg,
-                  continual_learning=replace(default_cfg.continual_learning,
-                                             update_mode=mode))
-    harness = make_harness(cfg, model=tiny_cnn_factory(),
-                           train_data=_conv_data(1), val_data=_conv_data(2))
+    cfg = replace(
+        default_cfg,
+        continual_learning=replace(default_cfg.continual_learning, update_mode=mode),
+    )
+    harness = make_harness(
+        cfg, model=tiny_cnn_factory(), train_data=_conv_data(1), val_data=_conv_data(2)
+    )
     updater = create_updater(cfg=cfg, modelHarness=harness)
     batch = next(iter(harness.get_train_dataloaders()[0]))
 
@@ -103,8 +107,10 @@ def _split(default_cfg, make_harness, tiny_cnn_factory, mode: str) -> tuple[int,
 @pytest.fixture()
 def cost(default_cfg, make_harness, tiny_cnn):
     """mode -> (flops inside fwd_bwd, flops inside update_post_fwd_bwd)."""
+
     def measure(mode: str) -> tuple[int, int]:
         return _split(default_cfg, make_harness, type(tiny_cnn), mode)
+
     return measure
 
 

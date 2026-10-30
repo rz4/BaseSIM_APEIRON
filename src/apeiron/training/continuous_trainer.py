@@ -21,10 +21,8 @@ Logging layout of one round, which downstream analysis depends on:
 
 from __future__ import annotations
 
-from typing import Any, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Iterator, Optional, Sequence, Tuple
 
-import torch
-from torch.utils.data import DataLoader
 
 from apeiron.config.configuration import Config
 from apeiron.logger.logger import get_logger

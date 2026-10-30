@@ -42,8 +42,10 @@ from apeiron.training.continuous_trainer import ContinuousTrainer
 
 def _fixed(seed: int, n: int = 32, in_f: int = 4, nc: int = 3) -> TensorDataset:
     generator = torch.Generator().manual_seed(seed)
-    return TensorDataset(torch.randn(n, in_f, generator=generator),
-                         torch.randint(0, nc, (n,), generator=generator))
+    return TensorDataset(
+        torch.randn(n, in_f, generator=generator),
+        torch.randint(0, nc, (n,), generator=generator),
+    )
 
 
 def _rows(cfg, harness) -> list[tuple[int, frozenset]]:
@@ -56,10 +58,8 @@ def _rows(cfg, harness) -> list[tuple[int, frozenset]]:
     """
     path = Path(tempfile.mkdtemp()) / "m.csv"
     logger = Logger(backend="none", csv_path=path)
-    with patch("apeiron.training.continuous_trainer.get_logger",
-               return_value=logger):
-        trainer = ContinuousTrainer(cfg, harness, logger,
-                                    FLOPSProfiler(warmup_iters=0))
+    with patch("apeiron.training.continuous_trainer.get_logger", return_value=logger):
+        trainer = ContinuousTrainer(cfg, harness, logger, FLOPSProfiler(warmup_iters=0))
         trainer.outer_cl_training_loop(drift_event_id=3)
     frame = logger.to_dataframe()
     assert frame is not None, "nothing was recorded"
@@ -72,8 +72,10 @@ def _rows(cfg, harness) -> list[tuple[int, frozenset]]:
 @pytest.fixture()
 def harness_with_history(default_cfg):
     from conftest import DummyHarness
-    harness = DummyHarness(default_cfg, hist_train_data=_fixed(5),
-                           hist_val_data=_fixed(9))
+
+    harness = DummyHarness(
+        default_cfg, hist_train_data=_fixed(5), hist_val_data=_fixed(9)
+    )
     harness.register_task([1.0])
     return harness
 
@@ -91,10 +93,10 @@ class TestTheValidationRowIsCoLocated:
     ):
         """The pairing the comment promises: one step carries both."""
         rows = _rows(default_cfg, harness_with_history)
-        loss_steps = {s for s, names in rows
-                      if any("jvp_reg_total_loss" in n for n in names)}
-        val_steps = {s for s, names in rows
-                     if any("val_post_" in n for n in names)}
+        loss_steps = {
+            s for s, names in rows if any("jvp_reg_total_loss" in n for n in names)
+        }
+        val_steps = {s for s, names in rows if any("val_post_" in n for n in names)}
         assert loss_steps, "no CL loss row was recorded"
         assert val_steps, "no post-CL validation row was recorded"
         assert val_steps <= loss_steps, (
@@ -103,8 +105,9 @@ class TestTheValidationRowIsCoLocated:
             f"share a step or a reader cannot join them"
         )
 
-    def test_validation_lands_on_the_LAST_cl_step(self, default_cfg,
-                                                   harness_with_history):
+    def test_validation_lands_on_the_LAST_cl_step(
+        self, default_cfg, harness_with_history
+    ):
         """The exact failure mode: off by one, every value correct.
 
         It is the LAST loss row validation shares a step with, not the
@@ -114,8 +117,9 @@ class TestTheValidationRowIsCoLocated:
         on 2.
         """
         rows = _rows(default_cfg, harness_with_history)
-        loss_steps = [s for s, names in rows
-                      if any("jvp_reg_total_loss" in n for n in names)]
+        loss_steps = [
+            s for s, names in rows if any("jvp_reg_total_loss" in n for n in names)
+        ]
         val_step = _step_of(rows, "val_post_")
         assert loss_steps and val_step is not None
         assert val_step == max(loss_steps), (
@@ -149,13 +153,17 @@ class TestTheTransferRowIsAlsoAnnotation:
         """`fwt` and the test accuracies annotate a round rather than
         starting a new one, so their step must carry other metrics too."""
         rows = _rows(default_cfg, harness_with_history)
-        transfer_steps = [(s, names) for s, names in rows
-                          if any(n.endswith("/fwt") or "test_curr_acc" in n
-                                 for n in names)]
+        transfer_steps = [
+            (s, names)
+            for s, names in rows
+            if any(n.endswith("/fwt") or "test_curr_acc" in n for n in names)
+        ]
         for step, names in transfer_steps:
-            others = {n for n in names
-                      if "fwt" not in n and "test_" not in n
-                      and not n.endswith("step")}
+            others = {
+                n
+                for n in names
+                if "fwt" not in n and "test_" not in n and not n.endswith("step")
+            }
             assert others, (
                 f"step {step} carries only transfer metrics {sorted(names)}; "
                 f"they annotate a round and should share its step"

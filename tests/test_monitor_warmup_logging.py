@@ -80,9 +80,7 @@ def _one_batch(harness):
 
 class TestEveryEvaluationIsRecorded:
     @pytest.mark.parametrize("warmup", [0, 1, 2, 5])
-    def test_every_warmup_evaluation_is_logged(
-        self, cfg, dummy_harness, warmup
-    ):
+    def test_every_warmup_evaluation_is_logged(self, cfg, dummy_harness, warmup):
         """Changed from A65's pinned behaviour by A66: warmup evaluations
         used to be silently dropped from the file, so raising warmup_iters
         to profile more carefully deleted data points. Every evaluation is
@@ -100,9 +98,7 @@ class TestEveryEvaluationIsRecorded:
         )
 
     @pytest.mark.parametrize("warmup", [0, 1, 2, 5])
-    def test_an_eval_row_appears_once_past_the_window(
-        self, cfg, dummy_harness, warmup
-    ):
+    def test_an_eval_row_appears_once_past_the_window(self, cfg, dummy_harness, warmup):
         """The other half: the gate must open, or nothing would ever be
         recorded and the first assertion would pass vacuously."""
         monitor, rows = _monitor(cfg, dummy_harness, warmup)

@@ -58,8 +58,10 @@ from apeiron.training.continuous_trainer import ContinuousTrainer
 
 def _fixed(seed: int, n: int = 32, in_f: int = 4, nc: int = 3) -> TensorDataset:
     generator = torch.Generator().manual_seed(seed)
-    return TensorDataset(torch.randn(n, in_f, generator=generator),
-                         torch.randint(0, nc, (n,), generator=generator))
+    return TensorDataset(
+        torch.randn(n, in_f, generator=generator),
+        torch.randint(0, nc, (n,), generator=generator),
+    )
 
 
 def _call_sequence(cfg, harness) -> list[tuple[str, bool, tuple[str, ...]]]:
@@ -86,19 +88,18 @@ def _call_sequence(cfg, harness) -> list[tuple[str, bool, tuple[str, ...]]]:
             stage["name"] = name
 
         def log(self, metrics, *args, increment=True, **kwargs):
-            calls.append((stage["name"], bool(increment),
-                          tuple(sorted(metrics))))
+            calls.append((stage["name"], bool(increment), tuple(sorted(metrics))))
 
         def __getattr__(self, _name):
             return lambda *a, **kw: None
 
     recording = Recording()
-    injected = Logger(backend="none",
-                      csv_path=Path(tempfile.mkdtemp()) / "m.csv")
+    injected = Logger(backend="none", csv_path=Path(tempfile.mkdtemp()) / "m.csv")
     injected.stage = recording.stage
     injected.log = recording.log
-    with patch("apeiron.training.continuous_trainer.get_logger",
-               return_value=recording):
+    with patch(
+        "apeiron.training.continuous_trainer.get_logger", return_value=recording
+    ):
         trainer = ContinuousTrainer(cfg, harness, injected, profiler)
         trainer.outer_cl_training_loop(drift_event_id=3)
     return calls
@@ -106,8 +107,7 @@ def _call_sequence(cfg, harness) -> list[tuple[str, bool, tuple[str, ...]]]:
 
 def _advance_counts(cfg, harness) -> collections.Counter:
     """(stage, advances?) -> how many log calls, over one outer round."""
-    return collections.Counter((s, a) for s, a, _n in
-                               _call_sequence(cfg, harness))
+    return collections.Counter((s, a) for s, a, _n in _call_sequence(cfg, harness))
 
 
 #: `max_iter` values the count rule is asserted at.
@@ -118,9 +118,11 @@ ITERATIONS = (1, 2, 3, 5)
 def harness(default_cfg):
     """History, and TWO past tasks so the transfer row's BWT is computable."""
     from conftest import DummyHarness
+
     torch.manual_seed(5)
-    built = DummyHarness(default_cfg, hist_train_data=_fixed(5),
-                         hist_val_data=_fixed(9))
+    built = DummyHarness(
+        default_cfg, hist_train_data=_fixed(5), hist_val_data=_fixed(9)
+    )
     built.register_task([1.0])
     built.register_task([2.0])
     return built
@@ -172,13 +174,12 @@ class TestHowManyRowsARoundLogs:
     """
 
     @pytest.mark.parametrize("max_iter", ITERATIONS)
-    def test_the_cl_row_count_follows_max_iter(self, default_cfg, harness,
-                                               max_iter):
+    def test_the_cl_row_count_follows_max_iter(self, default_cfg, harness, max_iter):
         """One row per inner iteration, plus the profiler row that closes
         the round."""
         from dataclasses import replace
-        cfg = replace(default_cfg,
-                      train=replace(default_cfg.train, max_iter=max_iter))
+
+        cfg = replace(default_cfg, train=replace(default_cfg.train, max_iter=max_iter))
         counts = _advance_counts(cfg, harness)
         total = counts[("cl", True)] + counts[("cl", False)]
         assert total == max_iter + 1, (
@@ -188,18 +189,16 @@ class TestHowManyRowsARoundLogs:
         )
 
     @pytest.mark.parametrize("max_iter", ITERATIONS)
-    def test_a_round_logs_exactly_two_eval_rows(self, default_cfg, harness,
-                                                max_iter):
+    def test_a_round_logs_exactly_two_eval_rows(self, default_cfg, harness, max_iter):
         """The validation annotation and the transfer row, whatever the
         iteration count."""
         from dataclasses import replace
-        cfg = replace(default_cfg,
-                      train=replace(default_cfg.train, max_iter=max_iter))
+
+        cfg = replace(default_cfg, train=replace(default_cfg.train, max_iter=max_iter))
         counts = _advance_counts(cfg, harness)
         total = counts[("eval", True)] + counts[("eval", False)]
         assert total == 2, (
-            f"max_iter={max_iter}: the round logged {total} eval rows, "
-            f"expected 2"
+            f"max_iter={max_iter}: the round logged {total} eval rows, expected 2"
         )
 
 
@@ -237,13 +236,21 @@ class TestTheOrderOfTheClosingRows:
     def _closing(self, cfg, harness):
         calls = _call_sequence(cfg, harness)
         transfer = next(
-            (i for i, (s, _a, names) in enumerate(calls)
-             if s == "eval" and any(n.startswith("test_") for n in names)),
-            None)
+            (
+                i
+                for i, (s, _a, names) in enumerate(calls)
+                if s == "eval" and any(n.startswith("test_") for n in names)
+            ),
+            None,
+        )
         profiler = next(
-            (i for i, (s, _a, names) in enumerate(calls)
-             if s == "cl" and all(n.startswith("cperf_") for n in names)),
-            None)
+            (
+                i
+                for i, (s, _a, names) in enumerate(calls)
+                if s == "cl" and all(n.startswith("cperf_") for n in names)
+            ),
+            None,
+        )
         return calls, transfer, profiler
 
     def test_both_closing_rows_are_logged(self, default_cfg, harness):
@@ -252,8 +259,7 @@ class TestTheOrderOfTheClosingRows:
         assert transfer is not None, "no transfer row was logged"
         assert profiler is not None, "no CL profiler row was logged"
 
-    def test_the_transfer_row_precedes_the_profiler_row(self, default_cfg,
-                                                        harness):
+    def test_the_transfer_row_precedes_the_profiler_row(self, default_cfg, harness):
         """`src/` logs the transfer metrics, then the round's profiler
         summary. Each takes the next step, so swapping them swaps two
         labels and every series on those rows fails its digest."""

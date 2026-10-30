@@ -45,9 +45,10 @@ from apeiron.config.configuration import (
 
 def _mps_available() -> bool:
     try:
-        return bool(hasattr(torch.backends, "mps")
-                    and torch.backends.mps.is_available())
-    except Exception:            # noqa: BLE001 — same guard the source uses
+        return bool(
+            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        )
+    except Exception:  # noqa: BLE001 — same guard the source uses
         return False
 
 
@@ -71,16 +72,16 @@ class TestDeviceSelection:
 
     @pytest.mark.parametrize("multi_gpu", [False, True])
     def test_it_returns_a_torch_device(self, multi_gpu):
-        assert isinstance(get_available_device(multi_gpu=multi_gpu),
-                          torch.device)
+        assert isinstance(get_available_device(multi_gpu=multi_gpu), torch.device)
 
     @pytest.mark.parametrize("multi_gpu", [False, True])
     def test_it_picks_the_documented_branch(self, multi_gpu):
-        assert get_available_device(multi_gpu=multi_gpu).type == \
-            _expected_device_type()
+        assert get_available_device(multi_gpu=multi_gpu).type == _expected_device_type()
 
-    @pytest.mark.skipif(torch.cuda.is_available(),
-                        reason="the CPU/MPS precedence only applies without CUDA")
+    @pytest.mark.skipif(
+        torch.cuda.is_available(),
+        reason="the CPU/MPS precedence only applies without CUDA",
+    )
     def test_mps_is_preferred_over_cpu_when_present(self):
         """The branch one rebuild dropped. On a host with MPS the answer
         must be MPS, and on a host without it must be CPU -- so this case
@@ -88,8 +89,9 @@ class TestDeviceSelection:
         expected = "mps" if _mps_available() else "cpu"
         assert get_available_device().type == expected
 
-    @pytest.mark.skipif(not torch.cuda.is_available(),
-                        reason="needs a CUDA host to observe the index")
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="needs a CUDA host to observe the index"
+    )
     def test_multi_gpu_decides_whether_an_index_is_pinned(self):
         """`multi_gpu=True` leaves the device unindexed so the caller can
         spread over all of them; `False` restricts to the chosen one."""
@@ -170,9 +172,7 @@ class TestKvToNested:
         A shell that leaves a space after `--set` therefore produces a
         key that no dataclass field matches, and the failure surfaces
         later as an unexpected-keyword TypeError."""
-        assert kv_to_nested(["  spaced.key  =  2  "]) == {
-            "  spaced": {"key  ": 2}
-        }
+        assert kv_to_nested(["  spaced.key  =  2  "]) == {"  spaced": {"key  ": 2}}
 
     def test_an_empty_key_is_accepted(self):
         assert kv_to_nested(["=1"]) == {"": 1}

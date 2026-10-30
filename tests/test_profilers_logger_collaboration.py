@@ -57,10 +57,9 @@ class RecordingLogger:
     def info(self, msg, level=0, *args, **kwargs):
         self.info_calls.append((msg, level))
 
-    def log(self, metrics, step=None, commit=True, prefix=True,
-            increment=True):
+    def log(self, metrics, step=None, commit=True, prefix=True, increment=True):
         self.log_calls.append(metrics)
-        metrics.items()          # the real one does this; strings fail
+        metrics.items()  # the real one does this; strings fail
 
     def stage(self, name):
         pass

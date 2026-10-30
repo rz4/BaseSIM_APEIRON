@@ -91,8 +91,9 @@ def delegating(default_cfg, tiny_model):
     instantiated, so the bodies would be unreachable and unassertable.
     """
     namespace = {
-        name: (lambda self, *a, _n=name, **k:
-               getattr(super(type(self), self), _n)(*a, **k))
+        name: (
+            lambda self, *a, _n=name, **k: getattr(super(type(self), self), _n)(*a, **k)
+        )
         for name in REFUSING_HOOKS
     }
     Delegating = type("Delegating", (BaseModelHarness,), namespace)
@@ -120,18 +121,16 @@ class TestTheHooksAreAbstract:
             f"{sorted(ABSTRACT_HOOKS)}"
         )
 
-    def test_the_base_class_cannot_be_instantiated(self, default_cfg,
-                                                   tiny_model):
+    def test_the_base_class_cannot_be_instantiated(self, default_cfg, tiny_model):
         with pytest.raises(TypeError):
-            BaseModelHarness(default_cfg, tiny_model)   # type: ignore[abstract]
+            BaseModelHarness(default_cfg, tiny_model)  # type: ignore[abstract]
 
 
 class TestTheBodiesRefuse:
     """The body half, which is what a delegating subclass reaches."""
 
     @pytest.mark.parametrize("hook", REFUSING_HOOKS)
-    def test_calling_up_raises_rather_than_returning_none(self, delegating,
-                                                          hook):
+    def test_calling_up_raises_rather_than_returning_none(self, delegating, hook):
         """The finding. An empty body returns `None`, and `None` here is
         unpacked into loaders and handed to the trainer."""
         with pytest.raises(NotImplementedError):
@@ -144,11 +143,13 @@ class TestTheBodiesRefuse:
         the exact shape the regrowth produced."""
         source = inspect.getsource(getattr(BaseModelHarness, hook))
         stripped = [
-            line.strip() for line in source.splitlines()
+            line.strip()
+            for line in source.splitlines()
             if line.strip() and not line.strip().startswith(("#", "@", "def "))
         ]
         meaningful = [
-            line for line in stripped
+            line
+            for line in stripped
             if line not in ("...", "pass") and not line.startswith(('"', "'"))
         ]
         assert meaningful, (

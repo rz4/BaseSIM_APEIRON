@@ -22,8 +22,11 @@ class _Fires:
 
     def __init__(self, regime, detected=True):
         self._signal = DriftSignal(
-            regime=regime, drift_detected=detected, drift_score=1.0,
-            confidence=0.5, metadata={},
+            regime=regime,
+            drift_detected=detected,
+            drift_score=1.0,
+            confidence=0.5,
+            metadata={},
         )
         self.name = f"stub-{regime.value}"
 
@@ -40,21 +43,29 @@ class TestEnsembleTieIsDeterministic:
     the firing detectors, every time."""
 
     def test_a_tie_resolves_to_the_more_severe_regime(self):
-        pair = [_Fires(LearningRegime.CONTINUAL_LEARNING),
-                _Fires(LearningRegime.RETRAIN)]
+        pair = [
+            _Fires(LearningRegime.CONTINUAL_LEARNING),
+            _Fires(LearningRegime.RETRAIN),
+        ]
         for _ in range(20):
             signal = EnsembleDetector(detectors=list(pair), voting="any").update(1.0)
             assert signal.regime is LearningRegime.RETRAIN
 
     def test_order_does_not_matter(self):
         a = EnsembleDetector(
-            detectors=[_Fires(LearningRegime.FINE_TUNING),
-                       _Fires(LearningRegime.CONTINUAL_LEARNING)],
-            voting="any").update(1.0)
+            detectors=[
+                _Fires(LearningRegime.FINE_TUNING),
+                _Fires(LearningRegime.CONTINUAL_LEARNING),
+            ],
+            voting="any",
+        ).update(1.0)
         b = EnsembleDetector(
-            detectors=[_Fires(LearningRegime.CONTINUAL_LEARNING),
-                       _Fires(LearningRegime.FINE_TUNING)],
-            voting="any").update(1.0)
+            detectors=[
+                _Fires(LearningRegime.CONTINUAL_LEARNING),
+                _Fires(LearningRegime.FINE_TUNING),
+            ],
+            voting="any",
+        ).update(1.0)
         assert a.regime is b.regime
 
 
@@ -69,7 +80,8 @@ class TestEvalDetectorRefusesInsteadOfAsserting:
     def test_mismatched_reference_is_a_value_error(self):
         with pytest.raises(ValueError, match="reference"):
             ModelEvalDetector().update(
-                0.0, modelHarness=self._Harness(),
+                0.0,
+                modelHarness=self._Harness(),
                 reference_validation_metrics=[90.0],
                 higher_is_better={"accuracy": True, "loss": False},
             )
@@ -77,7 +89,8 @@ class TestEvalDetectorRefusesInsteadOfAsserting:
     def test_mismatched_directions_is_a_value_error(self):
         with pytest.raises(ValueError, match="higher_is_better"):
             ModelEvalDetector().update(
-                0.0, modelHarness=self._Harness(),
+                0.0,
+                modelHarness=self._Harness(),
                 reference_validation_metrics=[90.0, 1.0],
                 higher_is_better={"accuracy": True},
             )

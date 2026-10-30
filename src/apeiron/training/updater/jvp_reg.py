@@ -119,8 +119,7 @@ class JVPRegUpdater(BaseUpdater):
         x_hist = xh[:n_hist]
         if self.rho_x != 0.0 and n_hist > 0:
             direction = self.data_sign * (
-                x.reshape(x.shape[0], -1).mean(0)
-                - xh.reshape(xh.shape[0], -1).mean(0)
+                x.reshape(x.shape[0], -1).mean(0) - xh.reshape(xh.shape[0], -1).mean(0)
             )
             direction = direction / (direction.norm() + EPS)
             x_hist = x_hist + self.rho_x * direction.reshape(xh.shape[1:])

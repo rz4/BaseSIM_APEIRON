@@ -294,9 +294,7 @@ class EnsembleDetector(BaseDriftDetector):
         super().__init__(name)
         detectors = list(detectors)
         if not detectors:
-            raise ValueError(
-                f"{type(self).__name__} needs at least one sub-detector"
-            )
+            raise ValueError(f"{type(self).__name__} needs at least one sub-detector")
         canonical = VOTING_ALIASES.get(str(voting).lower())
         if canonical is None:
             raise ValueError(
@@ -338,9 +336,7 @@ class EnsembleDetector(BaseDriftDetector):
             regime=regime,
             drift_detected=drift_detected,
             drift_score=sum(scores) / len(scores) if scores else 0.0,
-            confidence=(
-                sum(confidences) / len(confidences) if confidences else None
-            ),
+            confidence=(sum(confidences) / len(confidences) if confidences else None),
             metadata={
                 "n_detectors": n_detectors,
                 "n_votes": n_votes,

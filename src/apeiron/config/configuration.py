@@ -1,4 +1,5 @@
 """Immutable configuration sections and layered configuration resolution."""
+
 from __future__ import annotations
 
 import argparse
@@ -84,8 +85,11 @@ class DriftDetectionCfg:
 
     def __post_init__(self):
         names = self.ensemble_detectors
-        object.__setattr__(self, "ensemble_detectors",
-                           (names,) if isinstance(names, str) else tuple(names))
+        object.__setattr__(
+            self,
+            "ensemble_detectors",
+            (names,) if isinstance(names, str) else tuple(names),
+        )
 
 
 @dataclass(frozen=True)
@@ -137,9 +141,13 @@ def kv_to_nested(items):
 
 
 def env_overrides(prefix="APP_"):
-    return kv_to_nested([f"{key[len(prefix):].lower()}={value}"
-                         for key, value in os.environ.items()
-                         if key.startswith(prefix)])
+    return kv_to_nested(
+        [
+            f"{key[len(prefix) :].lower()}={value}"
+            for key, value in os.environ.items()
+            if key.startswith(prefix)
+        ]
+    )
 
 
 def parse_args(argv=None):
@@ -158,9 +166,9 @@ def load_toml(path):
 
 def _select_best_gpu():
     try:
-        output = subprocess.check_output([
-            "nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"
-        ])
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"]
+        )
         free_memory = [int(line.strip()) for line in output.splitlines()]
         return max(range(len(free_memory)), key=free_memory.__getitem__)
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -195,9 +203,13 @@ def build_config(argv=None):
         values["device"] = args.device
     if args.multi_gpu is not None:
         values["multi_gpu"] = args.multi_gpu
-    for key, cls in (("model", ModelCfg), ("data", DataCfg), ("train", TrainCfg),
-                     ("continual_learning", ContinualLearningCfg),
-                     ("drift_detection", DriftDetectionCfg)):
+    for key, cls in (
+        ("model", ModelCfg),
+        ("data", DataCfg),
+        ("train", TrainCfg),
+        ("continual_learning", ContinualLearningCfg),
+        ("drift_detection", DriftDetectionCfg),
+    ):
         values[key] = cls(**values.get(key, {}))
     if values.get("logging") is not None:
         values["logging"] = LoggingCfg(**values["logging"])

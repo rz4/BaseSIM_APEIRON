@@ -138,8 +138,7 @@ class TestTaskRegistryCap:
         dummy_harness.max_task_records = cap
         for i in range(registered):
             dummy_harness.register_task([float(i)])
-        assert len(dummy_harness.task_diagonals) == \
-            len(dummy_harness.eval_past_tasks())
+        assert len(dummy_harness.task_diagonals) == len(dummy_harness.eval_past_tasks())
         assert len(dummy_harness.task_diagonals) == min(cap, registered)
 
 

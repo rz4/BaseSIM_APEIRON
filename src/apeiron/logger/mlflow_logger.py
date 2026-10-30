@@ -97,8 +97,7 @@ class MLFlowLogger:
         if info is None:
             return None
         return (
-            f"{uri.rstrip('/')}/#/experiments/{info.experiment_id}"
-            f"/runs/{info.run_id}"
+            f"{uri.rstrip('/')}/#/experiments/{info.experiment_id}/runs/{info.run_id}"
         )
 
     # ------------------------------------------------------------------
@@ -119,7 +118,9 @@ class MLFlowLogger:
     # ------------------------------------------------------------------
     # config flattening
     # ------------------------------------------------------------------
-    def _flatten_config(self, config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    def _flatten_config(
+        self, config: dict[str, Any], prefix: str = ""
+    ) -> dict[str, Any]:
         """Flatten nested dicts into dot-separated keys."""
         flat: dict[str, Any] = {}
         for key, value in config.items():
@@ -166,7 +167,9 @@ class MLFlowLogger:
         mlflow.log_params({k: _truncate(v) for k, v in params.items()})
         return self.run
 
-    def finish(self, exit_code: int | None = None, save_csv: bool = True) -> Path | None:
+    def finish(
+        self, exit_code: int | None = None, save_csv: bool = True
+    ) -> Path | None:
         """End the run, optionally writing the CSV first.
 
         A non-zero ``exit_code`` marks the run ``FAILED``.

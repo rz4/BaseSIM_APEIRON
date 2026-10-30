@@ -63,14 +63,18 @@ from apeiron.driver.continuous_monitor import ContinuousMonitor
 #: define, and the first version of this file hard-coded the two names a
 #: different fixture happened to have, so it failed against `src/`. A
 #: criterion has to be measured with the fixture it will run under.
-DRIFT_NAMES = {"drift/score", "drift/detected", "drift/regime",
-               "drift/confidence"}
+DRIFT_NAMES = {"drift/score", "drift/detected", "drift/regime", "drift/confidence"}
 
 #: Names the original never writes. Monitor bookkeeping belongs to the
 #: object, not to the measurement record.
-FORBIDDEN = {"drift/drift_score", "drift/drift_detected",
-             "drift/drift_regime", "drift/batch_count",
-             "drift/stream_update_count", "drift/drift_event_count"}
+FORBIDDEN = {
+    "drift/drift_score",
+    "drift/drift_detected",
+    "drift/drift_regime",
+    "drift/batch_count",
+    "drift/stream_update_count",
+    "drift/drift_event_count",
+}
 
 
 def _logged_names(cfg, harness) -> set[str]:
@@ -97,8 +101,9 @@ def firing_cfg(default_cfg):
     """A loop short enough for a test and long enough to reach a check."""
     return replace(
         default_cfg,
-        drift_detection=replace(DriftDetectionCfg(), max_stream_updates=3,
-                                detection_interval=1),
+        drift_detection=replace(
+            DriftDetectionCfg(), max_stream_updates=3, detection_interval=1
+        ),
     )
 
 
@@ -135,17 +140,18 @@ class TestTheRunWritesItsMeasurements:
         for index in range(len(dummy_harness.eval_metrics)):
             cfg = replace(
                 default_cfg,
-                drift_detection=replace(DriftDetectionCfg(),
-                                        max_stream_updates=3,
-                                        detection_interval=1,
-                                        metric_index=index),
+                drift_detection=replace(
+                    DriftDetectionCfg(),
+                    max_stream_updates=3,
+                    detection_interval=1,
+                    metric_index=index,
+                ),
             )
             assert f"drift/metric_{index}" in _logged_names(cfg, dummy_harness)
 
 
 class TestItDoesNotRenameOrPadTheSchema:
-    def test_no_column_is_re_prefixed_with_its_stage(self, firing_cfg,
-                                                     dummy_harness):
+    def test_no_column_is_re_prefixed_with_its_stage(self, firing_cfg, dummy_harness):
         """The logger already supplies the `drift/` namespace from the
         stage, so `drift_score` becomes `drift/drift_score` -- which is
         what broke a full-stack run."""
@@ -155,13 +161,16 @@ class TestItDoesNotRenameOrPadTheSchema:
             f"namespace, and an analysis selects on the original names"
         )
 
-    def test_monitor_bookkeeping_is_not_a_measurement(self, firing_cfg,
-                                                      dummy_harness):
+    def test_monitor_bookkeeping_is_not_a_measurement(self, firing_cfg, dummy_harness):
         """Counters are state on the object. Writing them into the record
         makes them indistinguishable from model metrics during analysis."""
         names = _logged_names(firing_cfg, dummy_harness)
-        for counter in ("batch_count", "stream_update_count",
-                        "drift_event_count", "check_count"):
+        for counter in (
+            "batch_count",
+            "stream_update_count",
+            "drift_event_count",
+            "check_count",
+        ):
             assert f"drift/{counter}" not in names, (
                 f"{counter} is monitor state, not a measurement"
             )

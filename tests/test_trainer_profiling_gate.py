@@ -67,14 +67,17 @@ TAG = "update_fwd_bwd"
 
 def _loader(n: int = 32, in_f: int = 4, nc: int = 3, batch: int = 8) -> DataLoader:
     generator = torch.Generator().manual_seed(7)
-    data = TensorDataset(torch.randn(n, in_f, generator=generator),
-                         torch.randint(0, nc, (n,), generator=generator))
+    data = TensorDataset(
+        torch.randn(n, in_f, generator=generator),
+        torch.randint(0, nc, (n,), generator=generator),
+    )
     return DataLoader(data, batch_size=batch)
 
 
 def _trainer(cfg, harness, profiler):
-    return ContinuousTrainer(cfg=cfg, modelHarness=harness,
-                             logger=Logger(backend="none"), profiler=profiler)
+    return ContinuousTrainer(
+        cfg=cfg, modelHarness=harness, logger=Logger(backend="none"), profiler=profiler
+    )
 
 
 def _measurements(cfg, harness, *, warmup: int, iterations: int) -> int:
@@ -85,35 +88,33 @@ def _measurements(cfg, harness, *, warmup: int, iterations: int) -> int:
     train_iter = iter(loader)
     for iter_count in range(1, iterations + 1):
         _l, _r, train_iter, _h = trainer.inner_cl_training_loop(
-            iter_count=iter_count, cur_train_loader=loader,
-            train_iter=train_iter)
+            iter_count=iter_count, cur_train_loader=loader, train_iter=train_iter
+        )
     return len(profiler.profiles.get(TAG, {}).get("flop", []))
 
 
 class TestWarmupIsNotMeasured:
-    def test_a_warmup_iteration_opens_no_block(self, default_cfg,
-                                               dummy_harness):
+    def test_a_warmup_iteration_opens_no_block(self, default_cfg, dummy_harness):
         """The tag must not even exist: `measure_flops` creates the entry
         on first use, so an unconditional measurement is visible in the
         keys before any averaging happens."""
         profiler = FLOPSProfiler(warmup_iters=10)
         trainer = _trainer(default_cfg, dummy_harness, profiler)
         loader = _loader()
-        trainer.inner_cl_training_loop(iter_count=1, cur_train_loader=loader,
-                                       train_iter=iter(loader))
+        trainer.inner_cl_training_loop(
+            iter_count=1, cur_train_loader=loader, train_iter=iter(loader)
+        )
         assert TAG not in profiler.profiles, (
-            f"iteration 1 of 10 warmup iterations was profiled; warmup "
-            f"exists because the first steps are not representative, and "
-            f"including them biases every reported figure"
+            "iteration 1 of 10 warmup iterations was profiled; warmup "
+            "exists because the first steps are not representative, and "
+            "including them biases every reported figure"
         )
 
     @pytest.mark.parametrize("warmup", [0, 1, 3])
-    def test_the_count_follows_warmup_iters(self, default_cfg, dummy_harness,
-                                            warmup):
+    def test_the_count_follows_warmup_iters(self, default_cfg, dummy_harness, warmup):
         """`iter_count > warmup_iters`, strictly: over five iterations
         numbered 1..5, five minus `warmup` are measured."""
-        count = _measurements(default_cfg, dummy_harness,
-                              warmup=warmup, iterations=5)
+        count = _measurements(default_cfg, dummy_harness, warmup=warmup, iterations=5)
         assert count == 5 - warmup, (
             f"warmup_iters={warmup}: {count} block(s) opened over 5 "
             f"iterations, expected {5 - warmup}"
@@ -126,22 +127,22 @@ class TestWarmupIsNotMeasured:
         block has to be the unit it means to average: one optimizer step.
         Measuring every accumulation step leaves the mean unchanged and
         the throughput wrong."""
-        cfg = replace(default_cfg,
-                      train=replace(default_cfg.train,
-                                    grad_accumulation_steps=4))
+        cfg = replace(
+            default_cfg, train=replace(default_cfg.train, grad_accumulation_steps=4)
+        )
         count = _measurements(cfg, dummy_harness, warmup=0, iterations=3)
         assert count == 3, (
             f"{count} block(s) opened over 3 iterations with "
             f"grad_accumulation_steps=4; expected one per iteration"
         )
 
-    def test_without_a_profiler_nothing_breaks(self, default_cfg,
-                                               dummy_harness):
+    def test_without_a_profiler_nothing_breaks(self, default_cfg, dummy_harness):
         """`if self.profiler and ...` -- the first condition."""
         trainer = _trainer(default_cfg, dummy_harness, None)
         loader = _loader()
-        trainer.inner_cl_training_loop(iter_count=5, cur_train_loader=loader,
-                                       train_iter=iter(loader))
+        trainer.inner_cl_training_loop(
+            iter_count=5, cur_train_loader=loader, train_iter=iter(loader)
+        )
 
 
 class TestMeasurementStillHappens:
@@ -149,16 +150,16 @@ class TestMeasurementStillHappens:
     profiles at all."""
 
     def test_past_warmup_a_block_is_opened(self, default_cfg, dummy_harness):
-        count = _measurements(default_cfg, dummy_harness,
-                              warmup=1, iterations=3)
+        count = _measurements(default_cfg, dummy_harness, warmup=1, iterations=3)
         assert count > 0, "nothing was ever profiled"
 
     def test_the_block_recorded_a_flop_count(self, default_cfg, dummy_harness):
         profiler = FLOPSProfiler(warmup_iters=0)
         trainer = _trainer(default_cfg, dummy_harness, profiler)
         loader = _loader()
-        trainer.inner_cl_training_loop(iter_count=1, cur_train_loader=loader,
-                                       train_iter=iter(loader))
+        trainer.inner_cl_training_loop(
+            iter_count=1, cur_train_loader=loader, train_iter=iter(loader)
+        )
         assert profiler.profiles[TAG]["flop"][0] > 0, (
             "the block opened but counted nothing, so the measurement is "
             "empty and the counts above say nothing about real work"
@@ -166,8 +167,9 @@ class TestMeasurementStillHappens:
 
 
 class TestAnUninspectableBatchIsAccepted:
-    def test_a_batch_that_refuses_indexing_does_not_raise(self, default_cfg,
-                                                          dummy_harness):
+    def test_a_batch_that_refuses_indexing_does_not_raise(
+        self, default_cfg, dummy_harness
+    ):
         """`_safe_next` reads `batch[1].shape` to enforce `min_batch`. A
         batch that will not be indexed that way is accepted, because
         "cannot measure this" is not "this is too small"."""

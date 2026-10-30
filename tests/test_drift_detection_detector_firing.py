@@ -56,8 +56,7 @@ STREAMS: dict[str, list[float]] = {
     "flat": [0.25] * N,
     "sawtooth": [0.1 + 0.4 * ((i % 50) / 50) for i in range(N)],
     "spike": [0.9 if i in (150, 151, 152) else 0.1 for i in range(N)],
-    "two_steps": [0.1 if i < 150 else (0.5 if i < 300 else 0.9)
-                  for i in range(N)],
+    "two_steps": [0.1 if i < 150 else (0.5 if i < 300 else 0.9) for i in range(N)],
 }
 
 #: (stream, detector) -> the exact firings, as (step, regime, drift_score).
@@ -67,36 +66,39 @@ EXPECTED: dict[tuple[str, str], list[tuple[int, str, float]]] = {
     ("step", "ADWIN"): [(223, "continual_learning", 0.01)],
     ("step", "KSWIN"): [(213, "continual_learning", 0.02)],
     ("step", "PageHinkley"): [(333, "continual_learning", 0.02)],
-
     ("ramp", "ADWIN"): [(319, "continual_learning", 0.01)],
-    ("ramp", "KSWIN"): [(214, "continual_learning", 0.02),
-                        (314, "continual_learning", 0.02)],
+    ("ramp", "KSWIN"): [
+        (214, "continual_learning", 0.02),
+        (314, "continual_learning", 0.02),
+    ],
     ("ramp", "PageHinkley"): [],
-
     # Negative control: a constant stream has no drift to find.
     ("flat", "ADWIN"): [],
     ("flat", "KSWIN"): [],
     ("flat", "PageHinkley"): [],
-
     # Only the distribution test fires on a periodic sawtooth, and it fires
     # at the end of each period. ADWIN's mean is unchanged by it, which is
     # the behavioural difference between the two families.
     ("sawtooth", "ADWIN"): [],
-    ("sawtooth", "KSWIN"): [(99, "continual_learning", 0.02),
-                            (199, "continual_learning", 0.02),
-                            (299, "continual_learning", 0.02),
-                            (399, "continual_learning", 0.02)],
+    ("sawtooth", "KSWIN"): [
+        (99, "continual_learning", 0.02),
+        (199, "continual_learning", 0.02),
+        (299, "continual_learning", 0.02),
+        (399, "continual_learning", 0.02),
+    ],
     ("sawtooth", "PageHinkley"): [],
-
     # Negative control: three samples out of four hundred is not drift.
     ("spike", "ADWIN"): [],
     ("spike", "KSWIN"): [],
     ("spike", "PageHinkley"): [],
-
-    ("two_steps", "ADWIN"): [(191, "continual_learning", 0.01),
-                             (351, "continual_learning", 0.01)],
-    ("two_steps", "KSWIN"): [(163, "continual_learning", 0.02),
-                             (313, "continual_learning", 0.02)],
+    ("two_steps", "ADWIN"): [
+        (191, "continual_learning", 0.01),
+        (351, "continual_learning", 0.01),
+    ],
+    ("two_steps", "KSWIN"): [
+        (163, "continual_learning", 0.02),
+        (313, "continual_learning", 0.02),
+    ],
     ("two_steps", "PageHinkley"): [(316, "continual_learning", 0.02)],
 }
 
@@ -129,24 +131,25 @@ class TestTheControlsDiscriminate:
         """Otherwise a detector that never fires would pass the whole
         table, negative controls included."""
         for detector in MAKERS:
-            total = sum(len(v) for (_s, d), v in EXPECTED.items()
-                        if d == detector)
+            total = sum(len(v) for (_s, d), v in EXPECTED.items() if d == detector)
             assert total > 0, f"{detector} never fires in this table"
 
     def test_at_least_one_stream_is_silent_for_every_detector(self):
         """And a detector that fires on everything would pass the positive
         rows."""
         for detector in MAKERS:
-            silent = [s for (s, d), v in EXPECTED.items()
-                      if d == detector and not v]
+            silent = [s for (s, d), v in EXPECTED.items() if d == detector and not v]
             assert silent, f"{detector} has no silent stream in this table"
 
     def test_the_detectors_do_not_all_agree(self):
         """If every detector fired identically the table would be pinning
         one algorithm three times."""
         per_detector = {
-            d: sorted((s, tuple(step for step, _r, _sc in v))
-                      for (s, dd), v in EXPECTED.items() if dd == d)
+            d: sorted(
+                (s, tuple(step for step, _r, _sc in v))
+                for (s, dd), v in EXPECTED.items()
+                if dd == d
+            )
             for d in MAKERS
         }
         assert len(set(map(str, per_detector.values()))) == len(MAKERS)
@@ -225,8 +228,11 @@ class TestTheScoreIsATrailingWindow:
 def _kswin_steps(seed: int, stream_name: str) -> list[int]:
     """One detector instance over a whole stream; the steps it fires at."""
     detector = KSWINDetector(seed=seed)
-    return [step for step, value in enumerate(STREAMS[stream_name])
-            if detector.update(value).drift_detected]
+    return [
+        step
+        for step, value in enumerate(STREAMS[stream_name])
+        if detector.update(value).drift_detected
+    ]
 
 
 class TestKswinNeedsItsSeed:

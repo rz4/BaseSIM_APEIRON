@@ -142,7 +142,9 @@ class Logger:
     ) -> None:
         self._metrics.save(path, base_path=base_path, policy=policy)
 
-    def finish(self, exit_code: int | None = None, save_csv: bool = True) -> Path | None:
+    def finish(
+        self, exit_code: int | None = None, save_csv: bool = True
+    ) -> Path | None:
         return self._metrics.finish(exit_code=exit_code, save_csv=save_csv)
 
     def to_dataframe(self) -> Any:

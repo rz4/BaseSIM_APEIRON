@@ -44,7 +44,6 @@ def create_updater(cfg: Config, modelHarness) -> BaseUpdater:
         updater_cls = UPDATERS[mode]
     except KeyError:
         raise NotImplementedError(
-            f"Unknown update_mode: {mode!r}. Expected one of "
-            f"{sorted(UPDATERS)}."
+            f"Unknown update_mode: {mode!r}. Expected one of {sorted(UPDATERS)}."
         ) from None
     return updater_cls(cfg=cfg, modelHarness=modelHarness)

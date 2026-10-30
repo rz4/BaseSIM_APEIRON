@@ -468,13 +468,15 @@ class TestGradAccumulationRefusesZero:
 
     def test_zero_is_refused(self):
         with pytest.raises(ValueError, match="grad_accumulation_steps"):
-            TrainCfg(batch_size=8, num_workers=0, init_lr=0.01,
-                     grad_accumulation_steps=0)
+            TrainCfg(
+                batch_size=8, num_workers=0, init_lr=0.01, grad_accumulation_steps=0
+            )
 
     def test_negative_is_refused(self):
         with pytest.raises(ValueError, match="grad_accumulation_steps"):
-            TrainCfg(batch_size=8, num_workers=0, init_lr=0.01,
-                     grad_accumulation_steps=-2)
+            TrainCfg(
+                batch_size=8, num_workers=0, init_lr=0.01, grad_accumulation_steps=-2
+            )
 
     def test_one_is_the_default_and_fine(self):
         cfg = TrainCfg(batch_size=8, num_workers=0, init_lr=0.01)

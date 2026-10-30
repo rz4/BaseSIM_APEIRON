@@ -119,9 +119,7 @@ class FLOPSProfiler:
                 ) as prof:
                     yield
                 per_element = self._estimate_flops_per_elem(prof)
-                n_params = sum(
-                    p.numel() for p in model.parameters() if p.requires_grad
-                )
+                n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 flop = int(per_element) * int(n_params)
             finally:
                 elapsed = time.perf_counter() - (
@@ -169,10 +167,7 @@ class FLOPSProfiler:
             print("=" * 80)
             print("All Function Calls")
             print("=" * 80)
-            print(
-                f"{'operation':<40} {'calls':>7} {'flop/elem':>10} "
-                f"{'subtotal':>12}"
-            )
+            print(f"{'operation':<40} {'calls':>7} {'flop/elem':>10} {'subtotal':>12}")
             print("-" * 80)
             for key, count, per_element, contribution in rows:
                 shown = "n/a" if per_element is None else str(per_element)
@@ -204,9 +199,7 @@ class FLOPSProfiler:
             avg_time = float(sum(times)) / len(times)
             performance[f"{tag}_flop"] = avg_flop
             performance[f"{tag}_time"] = avg_time
-            performance[f"{tag}_flops"] = (
-                avg_flop / avg_time if avg_time > 0 else 0.0
-            )
+            performance[f"{tag}_flops"] = avg_flop / avg_time if avg_time > 0 else 0.0
         return performance
 
     def print_performance(self, logger: Any = None, level: int = 0) -> None:
