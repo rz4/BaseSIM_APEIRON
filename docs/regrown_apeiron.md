@@ -85,3 +85,26 @@ Equivalence beyond the verified surfaces. The resume path is unprobed
 the final assembly is one producer family, and off-surface behaviour is
 measured to differ in general (A46). The verified surfaces are exactly:
 the pinned run, this suite, and the three examples above.
+
+## Verified against the examples
+
+Each shipped example was run on this branch and on the original package
+with identical settings and seeds, and every series classified. The
+branch's entire deviation from `main` behaviour, across all three, is
+exactly the changes declared above — nothing unexplained:
+
+| example | identical | A66 (+2 warmup rows) | A31 (event ids) | A79 (`N/A` → empty) | unexplained |
+|---|---|---|---|---|---|
+| MNIST (2 seeds) | 28 series, values to the digit | `eval/accuracy`, `eval/loss` | `eval/drift_event_id` | n/a (ADWIN carries one) | **0** |
+| CIFAR-10 VGG-11 | 8 series | same two | — | n/a | **0** |
+| The Well (PR #140) | 6 series, incl. every VRMSE and drift score | `eval/mse`, `eval/vrmse` | — | `drift/confidence`: 19 string `N/A`s become empty cells | **0** |
+
+(Wall-clock `_time`/`_flops` series differ between any two runs of either
+implementation and are excluded. `eval/step`, a position-valued column,
+shifts by the two warmup rows around each validation annotation — the
+same annotation at the same batch, two rows later in the stage.)
+
+Drift fires at the same checks, final accuracies match to the digit, and
+every training value — losses, scores, accuracies — is byte-identical to
+the original implementation's. The fixes removed defects; they did not
+move the model.
