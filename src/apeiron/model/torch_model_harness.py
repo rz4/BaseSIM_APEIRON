@@ -1,293 +1,326 @@
+"""PyTorch model harness: the seam between a concrete model/data stream and APEIRON.
+
+A harness owns the model, the dataloaders, the optimizer and the criterion.
+The monitor and the trainer only ever talk to this surface, so every hook a
+subclass is expected to provide refuses loudly when it is not provided: an
+empty body would hand ``None`` to a caller that unpacks it into loaders.
+"""
+
 from __future__ import annotations
+
+import os
 import warnings
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Any, Optional, Callable, Tuple, List, Dict
+from typing import Any, Callable, Sequence
 
 import torch
-from torch import nn, Tensor
-from torch.utils.data import DataLoader, TensorDataset
-from torch.optim import Optimizer
 
 from apeiron.config.configuration import Config
+from apeiron.evaluation.metrics import accuracy
 
-MetricFn = Callable[[Tensor, Tensor], Any]
-CriterionFn = Callable[[Tensor, Tensor], Tensor]
+#: Default retention budget for the per-task train-test matrix ``R``.
+DEFAULT_MAX_TASK_RECORDS = 50
+
+#: Filename stem of a post-adaptation checkpoint, and the pointer file that
+#: always names the newest one.
+_CKPT_PREFIX = "drift_adaptation_"
+_CKPT_SUFFIX = ".pt"
+_LATEST_POINTER = "latest"
 
 
 class BaseModelHarness(ABC):
-    """
-    Members
-    -------
-    self.model : nn.Module
-    self.cfg   : Dict[str, Any]   # e.g., {"device": "cuda", ...}
+    """Abstract base for every model harness.
 
-    You must implement:
-      - get_loader(self)    -> DataLoader | Iterable
-      - get_criterion(self) -> CriterionFn
+    Subclasses supply the model-specific hooks; everything the framework
+    calls across the layer boundary (``_unpack``, ``_to_scalar``, ``eval``,
+    ``register_task``, ``eval_past_tasks``, ``task_diagonals``,
+    ``ckpts_enabled``, ``save_ckpt``) is implemented here.
     """
 
-    def __init__(self, cfg: Config, model: nn.Module):
-        self.model = model
+    def __init__(self, cfg: Config, model: torch.nn.Module):
         self.cfg = cfg
-        device = torch.device(self.cfg.device)
-        self.model.to(device)
+        self.device = torch.device(cfg.device)
+        self.model = model.to(self.device)
 
-        self.eval_metrics: Dict[str, MetricFn] = {}
+        #: name -> callable(output, target) -> scalar-ish
+        self.eval_metrics: dict[str, Callable[..., Any]] = {"accuracy": accuracy}
 
-        # One entry per drift event, oldest first: the frozen validation split of
-        # the window that was adapted to, paired with R[i][i] (see register_task).
-        self._task_records: List[Tuple[DataLoader, List[float]]] = []
-        self.max_task_records: int = 50
+        #: Retention budget for the task registry. Eviction keeps the MOST
+        #: RECENT records so that forgetting stays measurable against what
+        #: came before.
+        self.max_task_records: int = DEFAULT_MAX_TASK_RECORDS
 
+        #: [(frozen_eval_set, diagonal_metrics), ...], oldest first.
+        self._task_records: list[tuple[Any, list[float]]] = []
+
+    # ------------------------------------------------------------------
+    # Deprecated-hook bridge
+    # ------------------------------------------------------------------
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """
-        Bridge the deprecated ``get_optmizer`` spelling onto ``get_optimizer``.
+        """Bridge the historically misspelled ``get_optmizer`` hook.
 
-        A harness written against the old misspelled name keeps working: its
-        implementation is aliased onto the new name, so the framework only ever
-        has to call ``get_optimizer``.
+        A subclass that implements only the old spelling still satisfies the
+        ABC: the implementation is aliased onto ``get_optimizer`` (which is
+        the only name the framework calls) and a ``DeprecationWarning`` is
+        raised where the class is defined.
         """
         super().__init_subclass__(**kwargs)
-
         legacy = cls.__dict__.get("get_optmizer")
-        if legacy is None or "get_optimizer" in cls.__dict__:
+        if legacy is None:
             return
-
-        cls.get_optimizer = legacy  # type: ignore[method-assign]
         warnings.warn(
-            f"{cls.__name__} implements 'get_optmizer', which is deprecated and "
-            "will be removed in a future release. Rename the method to "
-            "'get_optimizer'.",
+            "`get_optmizer` is deprecated and will be removed; rename the hook "
+            "to `get_optimizer`.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
+        if "get_optimizer" not in cls.__dict__:
 
-    @abstractmethod
-    def get_optimizer(self) -> Optimizer:
-        """
-        Returns the optimizer object compatible with the trainable parameters
-        supports parameter groups for, e.g., different learning rates
-        """
-        raise NotImplementedError
+            def _bridged_get_optimizer(self, *args: Any, **kwargs: Any):
+                return legacy(self, *args, **kwargs)
 
-    def get_optmizer(self) -> Optimizer:
-        """
-        Deprecated misspelled alias for :meth:`get_optimizer`.
+            _bridged_get_optimizer.__name__ = "get_optimizer"
+            _bridged_get_optimizer.__qualname__ = f"{cls.__qualname__}.get_optimizer"
+            _bridged_get_optimizer.__doc__ = (
+                "Deprecated bridge onto this class's `get_optmizer`."
+            )
+            cls.get_optimizer = _bridged_get_optimizer  # type: ignore[assignment]
 
-        .. deprecated::
-            Use :meth:`get_optimizer` instead. This alias will be removed in a
-            future release.
-        """
+    def get_optmizer(self):
+        """Deprecated alias of :meth:`get_optimizer` (note the missing ``i``)."""
         warnings.warn(
-            "BaseModelHarness.get_optmizer() is deprecated and will be removed "
-            "in a future release. Use get_optimizer() instead.",
+            "`get_optmizer` is deprecated and will be removed; call "
+            "`get_optimizer` instead.",
             DeprecationWarning,
             stacklevel=2,
         )
         return self.get_optimizer()
 
-    # ----- subclass hooks -----
+    # ------------------------------------------------------------------
+    # Hooks a subclass must provide
+    # ------------------------------------------------------------------
+    @abstractmethod
+    def get_optimizer(self):
+        """Return the optimizer used for continual-learning updates."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_optimizer(); the "
+            "framework has no default optimizer for a harness."
+        )
 
     @abstractmethod
-    def update_data_stream(self) -> None:
-        """
-        Updates the data stream potentially leading to data drift
-        """
-        raise NotImplementedError
+    def update_data_stream(self):
+        """Advance the harness's data stream by one window."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement update_data_stream(); the "
+            "monitor advances the stream through this hook."
+        )
 
     @abstractmethod
-    def get_stream_dataloader(self) -> DataLoader:
-        """
-        Returns a training and validation dataloader compatible with the model input
-        that will be used for continual learning
-        """
-        raise NotImplementedError
+    def get_stream_dataloader(self):
+        """Return the dataloader the continuous monitor iterates."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_stream_dataloader(); "
+            "the monitor has nothing to iterate without it."
+        )
 
     @abstractmethod
-    def get_hist_dataloaders(
-        self,
-    ) -> Tuple[Optional[DataLoader], Optional[DataLoader]]:
-        """
-        Returns a training and validation dataloader with historical data (to measure drift) compatible with the model input
-        If there is no historical data, return None
-        """
-        raise NotImplementedError
+    def get_hist_dataloaders(self):
+        """Return ``(hist_train_loader, hist_val_loader)``, or ``(None, None)``."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_hist_dataloaders(); "
+            "return (None, None) explicitly when the harness keeps no history."
+        )
 
-    @torch.no_grad()
-    def get_train_dataloaders(self) -> Tuple[DataLoader, DataLoader]:
+    def get_train_dataloaders(self):
+        """Return ``(train_loader, val_loader)`` for the current window.
+
+        Not abstract -- a harness may inherit this refusal -- but a harness
+        that is trained or evaluated has to override it.
         """
-        Returns a training and validation dataloader compatible with the model input
-        that will be used to loop over for inference
-        """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_train_dataloaders(); "
+            "training and evaluation both read the current window from it."
+        )
 
     @abstractmethod
-    def get_criterion(self) -> CriterionFn:
-        """Return a loss function compatible with model output and dataloader labels"""
-        raise NotImplementedError
+    def get_criterion(self):
+        """Return the loss function used for training and loss metrics."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_criterion(); the "
+            "framework has no default loss for a harness."
+        )
 
-    # ----- helpers -----
-    def _unpack(self, batch: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+    # ------------------------------------------------------------------
+    # Batch / value seams, called by the monitor
+    # ------------------------------------------------------------------
+    def _unpack(self, batch) -> tuple[Any, Any]:
+        """Split a batch into ``(inputs, targets)``.
+
+        Two things out, or an error: a loader yielding ``(x, y, weight)`` is
+        a real shape, and silently dropping the third element would train on
+        mislabelled pairs.
         """
-        Returns the input and label from a batch
-        Note: override for compatibility with subclassed dataloader
-
-        :param batch: batch of data from dataloader
-        :type batch: Tuple[Tensor, Tensor]
-
-        :return: input and label of the batch
-        :rtype: Tuple[Tensor, Tensor]
-        """
-        x, y = batch
-        return x, y
+        if not isinstance(batch, (tuple, list)):
+            raise ValueError(
+                f"cannot unpack a batch of type {type(batch).__name__} into "
+                "(inputs, targets); override _unpack() for this loader"
+            )
+        if len(batch) != 2:
+            raise ValueError(
+                f"expected a batch of 2 elements (inputs, targets), got "
+                f"{len(batch)}; override _unpack() for this loader"
+            )
+        return batch[0], batch[1]
 
     @staticmethod
-    def _to_scalar(x: Tensor | float) -> float:
-        if isinstance(x, torch.Tensor):
-            return float(x.mean().item() if x.ndim > 0 else x.item())
-        return float(x)
+    def _to_scalar(value) -> float:
+        """Reduce a metric value to one float, averaging non-scalar tensors."""
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0:
+                return float(value.item())
+            return float(value.mean().item())
+        return float(value)
 
-    @torch.no_grad()
-    def _eval_loader(self, loader: DataLoader) -> List[float]:
-        """Stream over batches; return mean(metric) over batches (order preserved)."""
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+    def _eval_loader(self, loader) -> list[float]:
+        """Score ``self.eval_metrics`` over ``loader``, averaged per SAMPLE.
+
+        Raises ``RuntimeError`` on a loader with no batches: a model that was
+        never evaluated must not read as a model that scored zero, because
+        that zero travels into the CSV and into the drift detector.
+        """
+        names = list(self.eval_metrics)
+        totals = {name: 0.0 for name in names}
+        n_samples = 0
+        n_batches = 0
+
         self.model.eval()
-        sums = [0.0 for _ in self.eval_metrics]
-        counts = [0 for _ in self.eval_metrics]
+        with torch.no_grad():
+            for batch in loader:
+                inputs, targets = self._unpack(batch)
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                outputs = self.model(inputs)
+                size = int(targets.shape[0]) if targets.ndim > 0 else 1
+                for name in names:
+                    totals[name] += (
+                        self._to_scalar(self.eval_metrics[name](outputs, targets))
+                        * size
+                    )
+                n_samples += size
+                n_batches += 1
 
-        for batch in loader:  # assumes iterable
-            x, y = self._unpack(batch)
-            x, y = x.to(self.cfg.device), y.to(self.cfg.device)
+        if n_batches == 0 or n_samples == 0:
+            raise RuntimeError(
+                "cannot evaluate an empty dataloader: it yielded no batches, "
+                "and reporting 0.0 would be indistinguishable from a model "
+                "that genuinely scored zero"
+            )
+        return [totals[name] / n_samples for name in names]
 
-            # TODO: Add cuda amp support later. Needs config entry for amp
-            # if self.cfg.amp:
+    def eval(self) -> list[float]:
+        """Score the current validation window with ``self.eval_metrics``."""
+        _, val_loader = self.get_train_dataloaders()
+        return self._eval_loader(val_loader)
 
-            #     with torch.autocast(
-            #         device_type=self.device.type,
-            #         dtype=(
-            #             torch.float16 if self.device.type == "cuda" else torch.bfloat16
-            #         ),
-            #     ):
-            #         y_hat = self.model(x)
-            # else:
-            y_hat = self.model(x)
-
-            batch_size = y.shape[0]
-            for i, m in enumerate(self.eval_metrics.values()):
-                metric_value = self._to_scalar(m(y_hat, y))
-                # For metrics that return percentages (like accuracy), we need to
-                # convert back to counts for proper averaging across variable batch sizes
-                sums[i] += metric_value * batch_size
-                counts[i] += batch_size
-
-        if counts[0] == 0:
-            raise RuntimeError("Empty loader: nothing to evaluate.")
-
-        return [s / c for s, c in zip(sums, counts)]
-
-    @torch.no_grad()
-    def eval(self) -> List[float]:
-        """Stream over batches; return mean(metric) over batches (order preserved)."""
-        return self._eval_loader(self.get_train_dataloaders()[1])
-
-    @torch.no_grad()
-    def history_eval(self) -> Optional[List[float]]:
-        """Stream over batches; return mean(metric) over batches (order preserved).
-
-        Returns None if no historical data is available.
-        """
-        hist_loaders = self.get_hist_dataloaders()
-        if hist_loaders is None or hist_loaders[1] is None:
+    def history_eval(self) -> list[float] | None:
+        """Score the historical window, or ``None`` when there is no history."""
+        hist_train_loader, hist_val_loader = self.get_hist_dataloaders()
+        loader = hist_val_loader if hist_val_loader is not None else hist_train_loader
+        if loader is None:
             return None
+        return self._eval_loader(loader)
 
-        return self._eval_loader(hist_loaders[1])
-
-    # ----- per-task evaluation (train-test matrix R) -----
-
-    def register_task(self, diagonal_metrics: List[float]) -> None:
-        """Record the task just finished so later events can measure forgetting.
-
-        A *task* is one drift event: the window the detector fired on and the CL
-        loop adapted to. This freezes that window's validation split into a
-        standalone eval set and stores it alongside ``diagonal_metrics`` --
-        ``R[i][i]``, the score on the window measured right after adapting to it.
-        Both travel in the same record so eviction can never misalign a task's
-        eval set from its diagonal.
-
-        The split is copied into memory rather than referenced: the harness drops
-        its window tensors as the stream advances, and a plain ``DataLoader``
-        reference would keep the whole window alive through a view.
-
-        :param diagonal_metrics: ``eval()`` output for the current window, taken
-            after the CL loop finished.
-        :type diagonal_metrics: List[float]
-        """
-        xs: List[Tensor] = []
-        ys: List[Tensor] = []
-        for batch in self.get_train_dataloaders()[1]:
-            x, y = self._unpack(batch)
-            xs.append(x.detach().cpu().clone())
-            ys.append(y.detach().cpu().clone())
-
-        frozen = DataLoader(
-            TensorDataset(torch.cat(xs), torch.cat(ys)),
-            batch_size=self.cfg.train.batch_size,
-            shuffle=False,
-        )
-        self._task_records.append((frozen, list(diagonal_metrics)))
-
-        # Cap retained tasks; BWT then averages over the surviving ones.
-        while len(self._task_records) > self.max_task_records:
-            self._task_records.pop(0)
-
-    @torch.no_grad()
-    def eval_past_tasks(self) -> List[List[float]]:
-        """Score the current model on every registered task's frozen eval set.
-
-        Returns row ``T`` of the train-test matrix below the diagonal --
-        ``[R[T][i] for i < T]``, oldest task first, index-aligned with
-        :attr:`task_diagonals`. Empty until at least one task is registered.
-        """
-        return [self._eval_loader(loader) for loader, _ in self._task_records]
-
+    # ------------------------------------------------------------------
+    # Per-task transfer metrics (the train-test matrix R)
+    # ------------------------------------------------------------------
     @property
-    def task_diagonals(self) -> List[List[float]]:
-        """``R[i][i]`` per registered task, oldest first.
+    def task_diagonals(self) -> list[list[float]]:
+        """The diagonal of ``R``: one metric row per registered task, oldest first."""
+        return [list(diagonal) for _, diagonal in self._task_records]
 
-        Index-aligned with :meth:`eval_past_tasks`.
+    def register_task(self, diagonal_metrics: Sequence[float]) -> None:
+        """Freeze the current validation window as a past task.
+
+        The eval set is materialised (a copy, not a reference to a window the
+        stream will replace) and stored together with the diagonal measured
+        on it, so eviction can never misalign a task's eval set from its
+        diagonal.
         """
-        return [diagonal for _, diagonal in self._task_records]
+        _, val_loader = self.get_train_dataloaders()
+        self._task_records.append(
+            (self._freeze_eval_set(val_loader), [float(m) for m in diagonal_metrics])
+        )
+        self._enforce_task_retention()
 
+    def _freeze_eval_set(self, loader) -> list[tuple[Any, Any]]:
+        """Materialise ``loader`` into detached copies of its batches."""
+        frozen = []
+        for batch in loader:
+            inputs, targets = self._unpack(batch)
+            frozen.append((inputs.detach().clone(), targets.detach().clone()))
+        return frozen
+
+    def _enforce_task_retention(self) -> None:
+        """Drop the OLDEST records beyond ``max_task_records``."""
+        cap = int(self.max_task_records)
+        if cap <= 0:
+            self._task_records.clear()
+        elif len(self._task_records) > cap:
+            del self._task_records[: len(self._task_records) - cap]
+
+    def eval_past_tasks(self) -> list[list[float]]:
+        """Score the CURRENT model on every frozen window, oldest first."""
+        return [self._eval_loader(frozen) for frozen, _ in self._task_records]
+
+    # ------------------------------------------------------------------
+    # FIFO post-adaptation checkpointing
+    # ------------------------------------------------------------------
     @property
     def ckpts_enabled(self) -> bool:
-        return self.cfg.model.max_ckpts > 0 and bool(self.cfg.model.ckpts_path)
+        """Whether checkpointing has both a retention budget and a path."""
+        model_cfg = self.cfg.model
+        return bool(int(model_cfg.max_ckpts) > 0 and model_cfg.ckpts_path)
 
-    def build_checkpoint_payload(self) -> Any:
-        """Build the checkpoint object to save.
-
-        Subclasses can override this to include additional metadata beyond weights
-        (e.g., preprocessing scalers, feature names, architecture parameters)
-        so that saved checkpoints match the format expected by the loader.
-
-        Returns
-        -------
-        By default, returns ``model.state_dict()`` (weights only).
-        """
+    def build_checkpoint_payload(self) -> dict[str, Any]:
+        """The object ``save_ckpt`` writes; subclasses may extend it."""
         return self.model.state_dict()
 
-    def save_ckpt(self, event: int) -> str:
-        """Persist model state, evict oldest when over budget."""
-        d = Path(self.cfg.model.ckpts_path)
-        d.mkdir(parents=True, exist_ok=True)
+    def save_ckpt(self, event) -> str:
+        """Write ``drift_adaptation_<event>.pt`` and update the ``latest`` pointer.
 
-        fname = f"drift_adaptation_{event}.pt"
-        payload = self.build_checkpoint_payload()
-        torch.save(payload, d / fname)
-        (d / "latest").write_text(fname)
+        The newest ``max_ckpts`` files are kept; older ones are evicted by
+        modification time.
+        """
+        directory = self.cfg.model.ckpts_path
+        os.makedirs(directory, exist_ok=True)
 
-        # Guillotine the oldest survivors
-        alive = sorted(d.glob("drift_adaptation_*.pt"), key=lambda p: p.stat().st_mtime)
-        while len(alive) > self.cfg.model.max_ckpts:
-            alive.pop(0).unlink()
+        filename = f"{_CKPT_PREFIX}{event}{_CKPT_SUFFIX}"
+        path = os.path.join(directory, filename)
+        torch.save(self.build_checkpoint_payload(), path)
 
-        return str(d / fname)
+        with open(os.path.join(directory, _LATEST_POINTER), "w") as handle:
+            handle.write(filename)
+
+        self._evict_old_ckpts(directory)
+        return path
+
+    def _evict_old_ckpts(self, directory: str) -> None:
+        """Keep only the newest ``max_ckpts`` checkpoints in ``directory``."""
+        cap = int(self.cfg.model.max_ckpts)
+        if cap <= 0:
+            return
+        existing = [
+            name
+            for name in os.listdir(directory)
+            if name.startswith(_CKPT_PREFIX) and name.endswith(_CKPT_SUFFIX)
+        ]
+        # Oldest first; the name breaks ties on filesystems whose timestamps
+        # are coarser than a save takes.
+        existing.sort(
+            key=lambda name: (os.stat(os.path.join(directory, name)).st_mtime_ns, name)
+        )
+        for name in existing[: max(0, len(existing) - cap)]:
+            os.remove(os.path.join(directory, name))

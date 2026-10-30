@@ -1,45 +1,35 @@
-"""
-Drift detection module for continual learning systems.
+"""Drift detection: detectors, their shared base, and the config-driven factory.
 
-This module provides various drift detection algorithms that can signal when to switch between different learning regimes:
-- Stable: No significant drift
-- Continual Learning: Minor drift, use CL with replay
-- Fine-Tuning: Moderate drift, fine-tune model
-- Retrain: Severe drift, retrain from scratch
-
-Available detectors:
-- ADWINDetector: Adaptive windowing
-- KSWINDetector: Kolmogorov-Smirnov windowing
-- PageHinkleyDetector: Page-Hinkley test
-- ModelPerformanceDetector: Model-based using evidently
-- EnsembleDetector: Combine multiple detectors
+Re-exported here because sibling layers (`apeiron.monitoring`, the training
+loop) import these names from the package rather than from the modules.
 """
 
-from apeiron.drift_detection.detectors.base import (
-    BaseDriftDetector,
-    DriftSignal,
-    LearningRegime,
+from apeiron.drift_detection.detectors.base import BaseDriftDetector
+from apeiron.drift_detection.detectors.base import DriftSignal
+from apeiron.drift_detection.detectors.base import LearningRegime
+from apeiron.drift_detection.detectors.model_performance_detector import (
+    EnsembleDetector,
 )
+from apeiron.drift_detection.detectors.model_performance_detector import (
+    ModelEvalDetector,
+)
+from apeiron.drift_detection.detectors.model_performance_detector import (
+    ModelPerformanceDetector,
+)
+from apeiron.drift_detection.detectors.statistical_detectors import ADWINDetector
+from apeiron.drift_detection.detectors.statistical_detectors import KSWINDetector
 from apeiron.drift_detection.detectors.statistical_detectors import (
-    ADWINDetector,
-    KSWINDetector,
     PageHinkleyDetector,
 )
 
-from apeiron.drift_detection.detectors.model_performance_detector import (
-    ModelPerformanceDetector,
-    EnsembleDetector,
-    ModelEvalDetector,
-)
-
 __all__ = [
+    "ADWINDetector",
     "BaseDriftDetector",
     "DriftSignal",
-    "LearningRegime",
-    "ADWINDetector",
-    "KSWINDetector",
-    "PageHinkleyDetector",
-    "ModelPerformanceDetector",
     "EnsembleDetector",
+    "KSWINDetector",
+    "LearningRegime",
     "ModelEvalDetector",
+    "ModelPerformanceDetector",
+    "PageHinkleyDetector",
 ]

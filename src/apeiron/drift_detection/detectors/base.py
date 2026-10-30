@@ -1,23 +1,28 @@
-"""
-Base classes for drift detection in continual learning systems.
+"""Base types for the drift-detection layer.
 
-This module provides abstract interfaces for drift detectors that can signal
-when to switch between different learning regimes (continual learning, fine-tuning, retraining).
+Everything a detector is obliged to provide lives here: the regime ladder's
+vocabulary (:class:`LearningRegime`), the record a detector hands back on every
+metric value (:class:`DriftSignal`), and the abstract detector itself
+(:class:`BaseDriftDetector`), including the checkpoint protocol the training
+loop uses to resume a run mid-stream.
 """
+
+from __future__ import annotations
 
 import copy
+from abc import ABC
+from abc import abstractmethod
+from dataclasses import dataclass
+from dataclasses import field
 from enum import Enum
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class LearningRegime(Enum):
-    """
-    Learning regime recommendations based on drift severity.
-    - Stable: No significant drift, continue current strategy
-    - Continual Learning: Minor drift, use CL with replay
-    - Fine-Tuning: Moderate drift, fine-tune model
-    - Retrain: Severe drift, retrain from scratch
+    """What the detector asks the rest of the framework to do.
+
+    The members are ordered from least to most adaptation; the monitor acts on
+    the value, so these strings are part of the layer's contract.
     """
 
     STABLE = "stable"
@@ -26,147 +31,123 @@ class LearningRegime(Enum):
     RETRAIN = "retrain"
 
 
+#: Least to most adaptation. Used when several verdicts must be combined.
+REGIME_SEVERITY: tuple[LearningRegime, ...] = (
+    LearningRegime.STABLE,
+    LearningRegime.CONTINUAL_LEARNING,
+    LearningRegime.FINE_TUNING,
+    LearningRegime.RETRAIN,
+)
+
+
+@dataclass(repr=False)
 class DriftSignal:
-    """Container for drift detection results."""
+    """One detector's verdict on one metric value.
 
-    def __init__(
-        self,
-        regime: LearningRegime,
-        drift_detected: bool,
-        drift_score: float,
-        confidence: Optional[float] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        Initialize drift signal.
+    Parameters
+    ----------
+    regime : LearningRegime
+        The adaptation the detector recommends.
+    drift_detected : bool
+        Whether this step fired.
+    drift_score : float
+        The rolling drift rate over the detector's recent window.
+    confidence : float | None
+        The detector's confidence, where it has one.
+    metadata : dict | None
+        Detector-specific extras. ``None`` becomes an empty dict, so callers
+        can always subscript it.
+    """
 
-        Args:
-            regime: Recommended learning regime
-            drift_detected: Whether drift was detected
-            drift_score: Numeric drift severity score (higher = more drift)
-            confidence: Optional confidence in the detection (0-1)
-            metadata: Optional additional information
-        """
-        self.regime = regime
-        self.drift_detected = drift_detected
-        self.drift_score = drift_score
-        self.confidence = confidence
-        self.metadata = metadata or {}
+    regime: LearningRegime
+    drift_detected: bool
+    drift_score: float
+    confidence: float | None = None
+    metadata: dict[str, Any] | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if self.metadata is None:
+            self.metadata = {}
 
     def __repr__(self) -> str:
         return (
             f"DriftSignal(regime={self.regime.value}, "
             f"detected={self.drift_detected}, "
             f"score={self.drift_score:.4f}, "
-            f"confidence={self.confidence}, )"
+            f"confidence={self.confidence})"
         )
 
 
 class BaseDriftDetector(ABC):
-    """Abstract base class for all drift detectors."""
+    """The interface every detector in this layer implements.
 
-    _STATE_ATTRS: Optional[tuple[str, ...]] = None
+    Subclasses must provide :meth:`update` and :meth:`reset`. Both are declared
+    abstract -- a detector that forgets one cannot be constructed -- and both
+    have bodies that refuse, because a subclass may legitimately delegate
+    upward (``EnsembleDetector`` wraps members; a stateless detector has
+    nothing to reset) and the refusal has to name which detector it came from.
+    """
 
-    def __init__(self, name: str):
-        """
-        Initialize drift detector.
+    #: Attribute names this detector saves in :meth:`state_dict`. ``None``
+    #: means the subclass has not opted in, which is an error rather than an
+    #: empty checkpoint; declare ``()`` for a genuinely stateless detector.
+    _STATE_ATTRS: tuple[str, ...] | None = None
 
-        Args:
-            name: Human-readable name for this detector
-        """
+    def __init__(self, name: str = "BaseDriftDetector"):
         self.name = name
         self._is_initialized = False
+        self._drift_history: list[float] = []
+        self._value_history: list[float] = []
 
+    # -- the hooks ---------------------------------------------------------
     @abstractmethod
     def update(self, value: float, **kwargs) -> DriftSignal:
-        """
-        Update detector with new observation and check for drift.
-
-        Args:
-            value: Numeric value to monitor (e.g., loss, accuracy, prediction error)
-            **kwargs: Additional detector-specific parameters
-
-        Returns:
-            DriftSignal indicating whether drift occurred and recommended regime
-        """
+        """Feed one metric value and return the resulting signal."""
         raise NotImplementedError(f"Method not implemented for {self.name}")
 
     @abstractmethod
     def reset(self) -> None:
-        """Reset detector to initial state."""
+        """Forget everything learned so far."""
         raise NotImplementedError(f"Method not implemented for {self.name}")
 
-    def state_dict(self) -> Dict[str, Any]:
-        """Snapshot the detector's evolving state so a run can be resumed.
-
-        A detector is the one component whose verdict depends on everything it
-        has already seen, so restarting it from scratch mid-stream changes the
-        run's results rather than merely repeating work. This returns a
-        picklable snapshot of the attributes named in :attr:`_STATE_ATTRS`.
-
-        Returns:
-            Picklable mapping of state, tagged with the detector class name so
-            :meth:`load_state_dict` can reject a mismatched checkpoint.
-
-        Raises:
-            NotImplementedError: If the subclass has not declared
-                :attr:`_STATE_ATTRS`.
-        """
-        attrs = self._state_attrs()
-        state: Dict[str, Any] = {
-            attr: copy.deepcopy(getattr(self, attr)) for attr in attrs
-        }
-        state["detector_class"] = type(self).__name__
+    # -- checkpointing -----------------------------------------------------
+    def state_dict(self) -> dict[str, Any]:
+        """Snapshot this detector, deeply copied so it cannot be aliased."""
+        attrs = type(self)._STATE_ATTRS
+        if attrs is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not declare `_STATE_ATTRS`, so it "
+                f"cannot be checkpointed; declare the attribute names it needs "
+                f"to resume (or `()` if it is stateless)"
+            )
+        state: dict[str, Any] = {"detector_class": type(self).__name__}
+        for attr in attrs:
+            state[attr] = copy.deepcopy(getattr(self, attr))
         return state
 
-    def load_state_dict(self, state: Dict[str, Any]) -> None:
-        """Restore state produced by :meth:`state_dict`.
-
-        The detector must already be constructed from the same config that
-        produced the checkpoint; this restores only what the stream accumulated.
-
-        Args:
-            state: A mapping previously returned by :meth:`state_dict`.
-
-        Raises:
-            NotImplementedError: If the subclass has not declared
-                :attr:`_STATE_ATTRS`.
-            ValueError: If the checkpoint was written by a different detector
-                class.
-            KeyError: If the checkpoint is missing an expected attribute.
-        """
-        attrs = self._state_attrs()
-
-        expected = type(self).__name__
-        found = state.get("detector_class")
-        if found != expected:
-            raise ValueError(
-                f"Checkpoint was written by {found!r} but is being loaded into "
-                f"{expected!r}. Detector state is not portable across detector "
-                f"types -- check that [drift_detection] detector_name matches "
-                f"the run that produced this checkpoint."
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore a snapshot taken by :meth:`state_dict` of the same class."""
+        attrs = type(self)._STATE_ATTRS
+        if attrs is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not declare `_STATE_ATTRS`, so it "
+                f"cannot be restored from a checkpoint"
             )
-
+        saved = state.get("detector_class")
+        if saved != type(self).__name__:
+            raise ValueError(
+                f"checkpoint was written by {saved!r}, not "
+                f"{type(self).__name__!r}; refusing to load it"
+            )
         missing = [attr for attr in attrs if attr not in state]
         if missing:
             raise KeyError(
-                f"Checkpoint for {expected} is missing expected state: {missing}"
+                f"checkpoint for {type(self).__name__} is missing "
+                f"{', '.join(missing)}"
             )
-
-        # Deep-copy on the way in too, so loading one checkpoint into two
-        # detectors does not leave them sharing a single mutable object.
         for attr in attrs:
             setattr(self, attr, copy.deepcopy(state[attr]))
 
-    def _state_attrs(self) -> tuple[str, ...]:
-        """Return the declared state attributes, or explain that there are none."""
-        if self._STATE_ATTRS is None:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support checkpointing. Declare "
-                f"_STATE_ATTRS on the class -- an empty tuple if the detector "
-                f"keeps no state across update() calls (i.e., it is genuinely stateless)."
-            )
-        return self._STATE_ATTRS
-
+    # -- presentation ------------------------------------------------------
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name='{self.name}')"

@@ -1,24 +1,19 @@
-import torch
+"""Percentage accuracy for tensor-like classification predictions."""
 
 
-@torch.no_grad()
 def accuracy_topk(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
+    """Return one detached percentage tensor for each requested k."""
     maxk = max(topk)
+    if output.dim() != 2:
+        raise ValueError("Expected a batch-by-class output matrix")
     batch_size = target.size(0)
-
-    # maxk, dim, look_for_largest, results_sorted
-    _, pred = output.topk(maxk, 1, True, True)
-    pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-    res = []
-    for k in topk:
-        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-        res.append(correct_k.mul_(100.0 / batch_size))
-    return res
+    scale = 100.0 / batch_size
+    _, predictions = output.detach().topk(maxk, dim=1, largest=True, sorted=True)
+    predictions = predictions.t()
+    correct = predictions.eq(target.reshape(1, -1).expand_as(predictions))
+    return [correct[:k].reshape(-1).float().sum() * scale for k in topk]
 
 
-@torch.no_grad()
 def accuracy(output, target):
+    """Return top-1 accuracy as a percentage tensor."""
     return accuracy_topk(output, target, topk=(1,))[0]

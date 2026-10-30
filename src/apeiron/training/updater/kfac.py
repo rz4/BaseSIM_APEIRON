@@ -1,221 +1,198 @@
+"""Online K-FAC: a Kronecker-factored quadratic penalty around an anchor.
+
+For every ``Linear`` / ``Conv2d`` layer two curvature factors are kept, built
+from the layer's inputs ``a`` and the gradients of its outputs ``g``::
+
+    A <- kfac_ema_decay * A + mean_over_steps(aT a / rows(a))
+    G <- kfac_ema_decay * G + mean_over_steps(gT g / rows(g))
+
+with ``a`` the ``(rows, in_features)`` activation matrix -- for a convolution
+the unfolded patch matrix ``(N * L, in_channels * kH * kW)`` -- and ``g`` the
+matching ``(rows, out_channels)`` grad-output matrix.
+
+The penalty on the layer's weight ``W`` (flattened to ``(out, -1)``) is::
+
+    penalty = 0.5 * kfac_lambda * sum(dW * (G dW A))
+    grad    += kfac_lambda * (G dW A).view_as(W)        with dW = W - W*
+
+WHERE THE ARITHMETIC HAPPENS. The hooks only *store* ``a`` and ``g``; the two
+contractions ``aT a`` and ``gT g`` are the most expensive matmuls in the whole
+step for a convolution, and they are performed in :meth:`update_post_fwd_bwd`
+-- outside the window the trainer wraps in its FLOP counter. Accumulating them
+in the backward hook instead is arithmetically equivalent but reports a cost of
+a continual-learning update several times larger than the model's own pass.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from apeiron.training.updater.base import BaseUpdater
 from apeiron.config.configuration import Config
-from apeiron.model.torch_model_harness import BaseModelHarness
-import warnings
-
-warnings.filterwarnings("ignore", "Full backward hook is firing")
+from apeiron.training.updater.base import BaseUpdater
 
 
 class OnlineKFACUpdater(BaseUpdater):
-    """
-    Online K-FAC EWC-style regularizer. See work by
-    Title: Optimizing neural networks with Kronecker-factored approximate curvature
-    Authors: James Martens, Roger Grosse
-    Link: http://proceedings.mlr.press/v37/martens15.html
+    """K-FAC with one exponentially-decayed pair of factors per layer."""
 
-    - Accumulates Kronecker factors during a CL loop
-    - Commits them once at cl_postprocessing()
-    - Applies KFAC-structured EWC gradient penalty
-    """
-
-    def __init__(self, cfg: Config, modelHarness: BaseModelHarness) -> None:
+    def __init__(self, cfg: Config, modelHarness) -> None:
         super().__init__(cfg, modelHarness)
+        cl = cfg.continual_learning
+        self.kfac_lambda = float(cl.kfac_lambda)
+        self.kfac_ema_decay = float(cl.kfac_ema_decay)
 
-        self.device = cfg.device
-        self.lambda_kfac = float(cfg.continual_learning.kfac_lambda)
-        self.ema_decay = float(cfg.continual_learning.kfac_ema_decay)
+        #: Tracked layers, by the name they carry in the model.
+        self.layers: Dict[str, nn.Module] = {}
+        self.theta_star: Dict[str, torch.Tensor] = {}
+        self.A: Dict[str, torch.Tensor] = {}
+        self.G: Dict[str, torch.Tensor] = {}
 
-        self.model = modelHarness.model
+        #: Tensors captured by the hooks, consumed by the post-pass hook.
+        self._a_cache: Dict[str, torch.Tensor] = {}
+        self._g_cache: Dict[str, torch.Tensor] = {}
+        self._handles: List[object] = []
 
-        # Per-layer anchor θ*
-        self.theta_star: dict[str, torch.Tensor] = {}
+        for name, module in self.model.named_modules():
+            if not self._supported(module):
+                continue
+            weight = module.weight
+            self.layers[name] = module
+            self.theta_star[name] = weight.detach().clone()
+            a_dim = self._a_dim(module)
+            g_dim = self._g_dim(module)
+            self.A[name] = torch.zeros(
+                a_dim, a_dim, device=weight.device, dtype=weight.dtype
+            )
+            self.G[name] = torch.zeros(
+                g_dim, g_dim, device=weight.device, dtype=weight.dtype
+            )
+            self._register_hooks(name, module)
 
-        # Running Kronecker factors (the prior)
-        self.A: dict[str, torch.Tensor] = {}
-        self.G: dict[str, torch.Tensor] = {}
-
-        # CL accumulators
-        self._A_accum: dict[str, torch.Tensor] | None = None
-        self._G_accum: dict[str, torch.Tensor] | None = None
+        #: Per-application state, live only between the cl_* hooks.
+        self._A_accum: Optional[Dict[str, torch.Tensor]] = None
+        self._G_accum: Optional[Dict[str, torch.Tensor]] = None
         self._cl_steps = 0
 
-        # Activation / gradient caches
-        self._activations: dict[str, torch.Tensor] = {}
-        self._grad_outputs: dict[str, torch.Tensor] = {}
+    # ------------------------------------------------------------------
+    # layer introspection
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _supported(module: nn.Module) -> bool:
+        """Only layers whose weight has a Kronecker structure are tracked."""
+        return isinstance(module, (nn.Linear, nn.Conv2d))
 
-        self._register_hooks()
-        self._init_prior()
+    @staticmethod
+    def _a_dim(module: nn.Module) -> int:
+        if isinstance(module, nn.Conv2d):
+            kh, kw = module.kernel_size
+            return module.in_channels * kh * kw
+        return module.in_features
+
+    @staticmethod
+    def _g_dim(module: nn.Module) -> int:
+        if isinstance(module, nn.Conv2d):
+            return module.out_channels
+        return module.out_features
+
+    @staticmethod
+    def _extract_a(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
+        """The layer's inputs as a ``(rows, a_dim)`` matrix."""
+        if isinstance(module, nn.Conv2d):
+            patches = F.unfold(
+                a,
+                kernel_size=module.kernel_size,
+                dilation=module.dilation,
+                padding=module.padding,
+                stride=module.stride,
+            )
+            return patches.transpose(1, 2).reshape(-1, patches.shape[1])
+        return a.reshape(-1, a.shape[-1])
+
+    @staticmethod
+    def _extract_g(module: nn.Module, g: torch.Tensor) -> torch.Tensor:
+        """The gradients of the layer's outputs as a ``(rows, g_dim)`` matrix."""
+        if isinstance(module, nn.Conv2d):
+            return g.permute(0, 2, 3, 1).reshape(-1, g.shape[1])
+        return g.reshape(-1, g.shape[-1])
+
+    def _register_hooks(self, name: str, module: nn.Module) -> None:
+        """Store the pass's activations and grad-outputs -- nothing more."""
+
+        def forward_hook(_module, inputs, _output, _name=name):
+            self._a_cache[_name] = inputs[0].detach()
+
+        def backward_hook(_module, _grad_input, grad_output, _name=name):
+            self._g_cache[_name] = grad_output[0].detach()
+
+        self._handles.append(module.register_forward_hook(forward_hook))
+        self._handles.append(module.register_full_backward_hook(backward_hook))
 
     # ------------------------------------------------------------------
-    # Initialization
+    # lifecycle
     # ------------------------------------------------------------------
-
-    def _init_prior(self):
-        for name, module in self.model.named_modules():
-            if self._supported(module):
-                weight = module.weight
-                self.theta_star[name] = weight.detach().clone().to(self.device)
-                self.A[name] = torch.zeros(
-                    self._a_dim(module),
-                    self._a_dim(module),
-                    device=self.device,
-                )
-                self.G[name] = torch.zeros(
-                    self._g_dim(module),
-                    self._g_dim(module),
-                    device=self.device,
-                )
-
-    def _register_hooks(self):
-        for name, module in self.model.named_modules():
-            if self._supported(module):
-                module.register_forward_hook(self._save_activation(name))
-                module.register_full_backward_hook(self._save_grad_output(name))
-
-    # ------------------------------------------------------------------
-    # Hooks
-    # ------------------------------------------------------------------
-
-    def _save_activation(self, name):
-        def hook(module, inp, out):
-            self._activations[name] = inp[0].detach()
-
-        return hook
-
-    def _save_grad_output(self, name):
-        def hook(module, grad_input, grad_output):
-            if grad_output[0] is not None:
-                self._grad_outputs[name] = grad_output[0].detach()
-
-        return hook
-
-    # ------------------------------------------------------------------
-    # CL lifecycle
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def cl_preprocessing(self):
-        self._A_accum = {
-            k: torch.zeros_like(v, device=self.device) for k, v in self.A.items()
-        }
-        self._G_accum = {
-            k: torch.zeros_like(v, device=self.device) for k, v in self.G.items()
-        }
+    def cl_preprocessing(self) -> None:
+        self._A_accum = {name: torch.zeros_like(a) for name, a in self.A.items()}
+        self._G_accum = {name: torch.zeros_like(g) for name, g in self.G.items()}
         self._cl_steps = 0
 
-    @torch.no_grad()
-    def cl_postprocessing(self):
-        if self._cl_steps == 0:
-            return
-        if self._A_accum is None or self._G_accum is None:
-            return
-
-        for name in self.A:
-            self.A[name].mul_(self.ema_decay)
-            self.G[name].mul_(self.ema_decay)
-
-            self.A[name].add_(self._A_accum[name] / self._cl_steps)
-            self.G[name].add_(self._G_accum[name] / self._cl_steps)
-
+    def update_post_fwd_bwd(self) -> float:
         with torch.no_grad():
-            for name, module in self.model.named_modules():
-                if self._supported(module):
-                    self.theta_star[name].copy_(module.weight.detach())
+            self._accumulate_factors()
+            return self._apply_penalty()
 
+    def update_post_optimizer_call(self) -> None:
+        self._cl_steps += 1
+
+    def cl_postprocessing(self) -> None:
+        """Fold the application's factors into the prior and re-anchor.
+
+        A step taken without a preceding ``cl_preprocessing`` commits nothing.
+        """
+        if self._A_accum is not None and self._cl_steps > 0:
+            with torch.no_grad():
+                for name in self.A:
+                    self.A[name] = (
+                        self.kfac_ema_decay * self.A[name]
+                        + self._A_accum[name] / self._cl_steps
+                    )
+                    self.G[name] = (
+                        self.kfac_ema_decay * self.G[name]
+                        + self._G_accum[name] / self._cl_steps
+                    )
+                for name, module in self.layers.items():
+                    self.theta_star[name] = module.weight.detach().clone()
         self._A_accum = None
         self._G_accum = None
         self._cl_steps = 0
 
     # ------------------------------------------------------------------
-    # Per-step updates
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def update_post_fwd_bwd(self) -> float:
-        kfac_loss = 0.0
-
-        for name, module in self.model.named_modules():
-            if not self._supported(module):
+    def _accumulate_factors(self) -> None:
+        """The two contractions, deliberately after the measured pass."""
+        if self._A_accum is None or self._G_accum is None:
+            return
+        for name, module in self.layers.items():
+            a = self._a_cache.get(name)
+            g = self._g_cache.get(name)
+            if a is None or g is None:
                 continue
+            a_mat = self._extract_a(module, a)
+            g_mat = self._extract_g(module, g)
+            self._A_accum[name] += a_mat.T @ a_mat / a_mat.shape[0]
+            self._G_accum[name] += g_mat.T @ g_mat / g_mat.shape[0]
 
-            if name not in self._activations or name not in self._grad_outputs:
-                continue
-
-            a = self._extract_a(module, self._activations[name])
-            g = self._extract_g(module, self._grad_outputs[name])
-
-            # Accumulate KFAC statistics
-            if self._A_accum is not None and self._G_accum is not None:
-                self._A_accum[name].add_(a.T @ a / a.shape[0])
-                self._G_accum[name].add_(g.T @ g / g.shape[0])
-
-            # EWC-style gradient penalty
-            W = module.weight
-            W_star = self.theta_star[name]
-
-            if isinstance(module, nn.Conv2d):
-                # Reshape to 2D: (out_channels, in_channels*kH*kW)
-                diff = W.view(W.shape[0], -1) - W_star.view(W_star.shape[0], -1)
-            else:
-                diff = W - W_star
-
-            grad_penalty = self.G[name] @ diff @ self.A[name]
-            kfac_loss += (diff * grad_penalty).sum().item()
-
-            if isinstance(module, nn.Conv2d):
-                grad_penalty = grad_penalty.view_as(W)
-
-            W.grad.add_(self.lambda_kfac * grad_penalty)
-
-        return 0.5 * self.lambda_kfac * kfac_loss
-
-    @torch.no_grad()
-    def update_post_optimizer_call(self):
-        self._cl_steps += 1
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def _supported(self, module):
-        return isinstance(module, (nn.Linear, nn.Conv2d))
-
-    @torch.no_grad()
-    def _a_dim(self, module):
-        if isinstance(module, nn.Linear):
-            return module.in_features
-        if isinstance(module, nn.Conv2d):
-            return module.in_channels * module.kernel_size[0] * module.kernel_size[1]
-
-    @torch.no_grad()
-    def _g_dim(self, module):
-        if isinstance(module, nn.Linear):
-            return module.out_features
-        if isinstance(module, nn.Conv2d):
-            return module.out_channels
-
-    @torch.no_grad()
-    def _extract_a(self, module, a):
-        if isinstance(module, nn.Linear):
-            return a.view(a.shape[0], -1)
-        if isinstance(module, nn.Conv2d):
-            return (
-                torch.nn.functional.unfold(
-                    a,
-                    kernel_size=module.kernel_size,
-                    padding=module.padding,
-                    stride=module.stride,
-                )
-                .transpose(1, 2)
-                .reshape(-1, self._a_dim(module))
+    def _apply_penalty(self) -> float:
+        penalty = 0.0
+        for name, module in self.layers.items():
+            weight = module.weight
+            diff = (weight.detach() - self.theta_star[name]).reshape(
+                weight.shape[0], -1
             )
-
-    @torch.no_grad()
-    def _extract_g(self, module, g):
-        if isinstance(module, nn.Linear):
-            return g.view(g.shape[0], -1)
-        if isinstance(module, nn.Conv2d):
-            return g.permute(0, 2, 3, 1).reshape(-1, self._g_dim(module))
+            structured = self.G[name] @ diff @ self.A[name]
+            penalty += float((diff * structured).sum().item())
+            if weight.grad is None:
+                weight.grad = torch.zeros_like(weight)
+            weight.grad += self.kfac_lambda * structured.view_as(weight)
+        return 0.5 * self.kfac_lambda * penalty

@@ -1,83 +1,122 @@
-"""Unified logging interface combining metrics tracking and console output."""
+"""The unified logger every entry point builds.
+
+:class:`Logger` is a thin facade over a console logger and one metrics
+backend. The backend is chosen once, at construction:
+
+* ``"wandb"``  -> :class:`~apeiron.logger.wandb_logger.WandBLogger`
+* ``"mlflow"`` -> :class:`~apeiron.logger.mlflow_logger.MLFlowLogger`
+* anything else (including ``"none"``) -> ``WandBLogger(enabled=False)``
+
+The disabled wandb backend is used as the null object on purpose: the
+facade needs no second code path and CSV output keeps working, so
+``backend = "none"`` means "no run is opened and nothing is sent", not "no
+backend object".
+"""
 
 from __future__ import annotations
 
-import pandas as pd
 from pathlib import Path
 from typing import Any, Literal
 
-from apeiron.config.configuration import Config
 from apeiron.logger.console_logger import ConsoleLogger
-from apeiron.logger.wandb_logger import StageType, WandBLogger
 from apeiron.logger.mlflow_logger import MLFlowLogger
+from apeiron.logger.wandb_logger import StageType, WandBLogger
 
-
-# Type alias for metrics backend
+#: The metrics backends a config may ask for.
 MetricsBackend = Literal["wandb", "mlflow", "none"]
+
+#: Values :func:`configure_backend` accepts.
+VALID_BACKENDS: tuple[str, ...] = ("wandb", "mlflow", "none")
+
+#: The process-wide singleton handed out by :func:`get_logger`.
+_LOGGER: "Logger | None" = None
 
 
 class Logger:
-    """Unified logger with metrics tracking (WandB/MLflow) and console output."""
+    """Console logging plus one metrics backend, behind one object.
+
+    Parameters
+    ----------
+    backend : MetricsBackend
+        Which metrics backend to build. Defaults to ``"wandb"``, so a
+        config with no ``[logging]`` section talks to the service.
+    verbosity : str
+        Console verbosity, e.g. ``"INFO"`` or ``"INFO:2"``.
+    csv_path : str | Path | None
+        Where the backend writes its metrics CSV.
+    """
 
     def __init__(
         self,
-        verbosity: str = "INFO",
         backend: MetricsBackend = "wandb",
+        verbosity: str = "INFO",
         csv_path: str | Path | None = None,
-    ):
-        """Initialize unified logger.
+    ) -> None:
+        self._backend = backend
 
-        Args:
-            verbosity: Console level (DEBUG, INFO, INFO:n, WARNING, ERROR, CRITICAL)
-            backend: Metrics backend to use ("wandb", "mlflow", or "none")
-            csv_path: Save metrics to CSV at this path (disabled if None)
-        """
-
-        # Initialize metrics backend
-        if backend == "mlflow":
-            self._metrics: WandBLogger | MLFlowLogger = MLFlowLogger(
-                enabled=True, csv_path=csv_path
-            )
-        elif backend == "wandb":
-            self._metrics = WandBLogger(enabled=True, csv_path=csv_path)
-        else:  # "none"
+        if backend == "wandb":
+            self._metrics: Any = WandBLogger(enabled=True, csv_path=csv_path)
+        elif backend == "mlflow":
+            self._metrics = MLFlowLogger(enabled=True, csv_path=csv_path)
+        else:
+            # "none" -- and anything unrecognised -- takes the disabled
+            # backend, which records and writes CSVs but opens no run.
             self._metrics = WandBLogger(enabled=False, csv_path=csv_path)
 
-        self._backend = backend
         self._console = ConsoleLogger(
             verbosity=verbosity, get_step=lambda: self._metrics.step
         )
 
+    # ------------------------------------------------------------------
+    # properties
+    # ------------------------------------------------------------------
     @property
-    def backend(self) -> MetricsBackend:
-        """Get the current metrics backend."""
+    def backend(self) -> str:
+        """The backend name this logger was built with."""
         return self._backend
 
-    # Metrics/WandB methods
-    def init(
-        self,
-        cfg: Config,
-        project: str = "basesim-framework",
-        name: str | None = None,
-        tags: list[str] | None = None,
-        notes: str | None = None,
-        group: str | None = None,
-        **kwargs,
-    ):
-        """Initialize wandb run with config."""
-        return self._metrics.init(cfg, project, name, tags, notes, group, **kwargs)
+    @property
+    def verbosity(self) -> str:
+        return self._console.verbosity
 
-    def stage(self, name: StageType) -> None:
-        """Set current stage ('eval', 'drift', or 'cl')."""
-        self._metrics.stage(name)
+    @verbosity.setter
+    def verbosity(self, value: str) -> None:
+        self._console.verbosity = value
 
     @property
     def step(self) -> int:
         return self._metrics.step
 
     @property
-    def current_stage(self) -> StageType | None:
+    def current_stage(self) -> str | None:
         return self._metrics.current_stage
+
+    @property
+    def url(self) -> str | None:
+        """The run's URL, or ``None`` when no run is open."""
+        return self._metrics.url
+
+    @property
+    def csv_path(self) -> Path | None:
+        return self._metrics.csv_path
+
+    @csv_path.setter
+    def csv_path(self, value: str | Path | None) -> None:
+        self._metrics.csv_path = Path(value) if value is not None else None
+
+    @property
+    def metrics_history(self) -> list[dict[str, Any]]:
+        return self._metrics.metrics_history
+
+    # ------------------------------------------------------------------
+    # metrics delegation
+    # ------------------------------------------------------------------
+    def init(self, cfg: Any, **kwargs: Any) -> Any:
+        """Open the backend's run."""
+        return self._metrics.init(cfg, **kwargs)
+
+    def stage(self, name: StageType) -> None:
+        self._metrics.stage(name)
 
     def get_stage_step(self, stage: StageType) -> int:
         return self._metrics.get_stage_step(stage)
@@ -90,113 +129,104 @@ class Logger:
         prefix: bool = True,
         increment: bool = True,
     ) -> None:
-        """Log metrics with stage-aware prefixing."""
-        self._metrics.log(metrics, step, commit, prefix, increment)
+        """Forward one row of metrics to the backend, keywords and all."""
+        self._metrics.log(
+            metrics, step=step, commit=commit, prefix=prefix, increment=increment
+        )
 
     def save(
         self,
-        file_path: str | Path,
+        path: str | Path,
         base_path: str | Path | None = None,
-        policy: Literal["now", "live", "end"] = "now",
+        policy: str = "now",
     ) -> None:
-        """Save file to wandb."""
-        self._metrics.save(file_path, base_path, policy)
+        self._metrics.save(path, base_path=base_path, policy=policy)
 
-    def to_dataframe(self) -> pd.DataFrame | None:
-        """Convert metrics to DataFrame."""
+    def finish(self, exit_code: int | None = None, save_csv: bool = True) -> Path | None:
+        return self._metrics.finish(exit_code=exit_code, save_csv=save_csv)
+
+    def to_dataframe(self) -> Any:
         return self._metrics.to_dataframe()
 
     def to_csv(self, csv_path: str | Path | None = None) -> Path | None:
-        """Save metrics to CSV."""
         return self._metrics.to_csv(csv_path)
 
-    def finish(
-        self, exit_code: int | None = None, save_csv: bool = True
-    ) -> Path | None:
-        """Finish wandb run and save CSV."""
-        return self._metrics.finish(exit_code, save_csv)
+    # ------------------------------------------------------------------
+    # console delegation
+    # ------------------------------------------------------------------
+    def info(self, msg: str, level: int = 0) -> None:
+        self._console.info(msg, level)
 
-    @property
-    def url(self) -> str | None:
-        return self._metrics.url
+    def debug(self, msg: str) -> None:
+        self._console.debug(msg)
 
-    # Console logging methods
-    @property
-    def verbosity(self) -> str:
-        return self._console.verbosity
+    def warning(self, msg: str) -> None:
+        self._console.warning(msg)
 
-    @verbosity.setter
-    def verbosity(self, level: str) -> None:
-        self._console.verbosity = level
+    def error(self, msg: str) -> None:
+        self._console.error(msg)
 
-    def debug(self, msg: str, *args, **kwargs) -> None:
-        self._console.debug(msg, *args, **kwargs)
+    def critical(self, msg: str) -> None:
+        self._console.critical(msg)
 
-    def info(self, msg: str, level: int = 0, *args, **kwargs) -> None:
-        """Log at INFO:level tier (0=standard, 1+=more verbose)."""
-        self._console.info(msg, level, *args, **kwargs)
-
-    def warning(self, msg: str, *args, **kwargs) -> None:
-        self._console.warning(msg, *args, **kwargs)
-
-    def error(self, msg: str, *args, **kwargs) -> None:
-        self._console.error(msg, *args, **kwargs)
-
-    def critical(self, msg: str, *args, **kwargs) -> None:
-        self._console.critical(msg, *args, **kwargs)
-
-    def exception(self, msg: str, *args, **kwargs) -> None:
-        self._console.exception(msg, *args, **kwargs)
+    def exception(self, msg: str) -> None:
+        self._console.exception(msg)
 
 
-# Singleton for convenience
-_default_logger: Logger | None = None
+def configure_backend(cfg: Any) -> str:
+    """Resolve the metrics backend a config asks for.
+
+    A config with no ``[logging]`` section -- and ``None`` itself -- means
+    ``"wandb"``. An MLflow tracking URI is applied here, before any run is
+    started.
+
+    Raises
+    ------
+    ValueError
+        If the configured backend is not one of ``VALID_BACKENDS``.
+    """
+    if cfg is None:
+        return "wandb"
+
+    logging_cfg = getattr(cfg, "logging", None)
+    if logging_cfg is None:
+        return "wandb"
+
+    backend = getattr(logging_cfg, "backend", None) or "wandb"
+    if backend not in VALID_BACKENDS:
+        raise ValueError(
+            f"Invalid logging backend {backend!r}; expected one of "
+            f"{list(VALID_BACKENDS)}"
+        )
+
+    if backend == "mlflow":
+        tracking_uri = getattr(logging_cfg, "mlflow_tracking_uri", None)
+        if tracking_uri:
+            import mlflow
+
+            mlflow.set_tracking_uri(tracking_uri)
+
+    return backend
 
 
 def get_logger(
-    verbosity: str = "INFO",
     backend: MetricsBackend = "wandb",
+    verbosity: str = "INFO",
     csv_path: str | Path | None = None,
 ) -> Logger:
-    """Get or create the default Logger instance.
+    """The process-wide :class:`Logger`.
 
-    Args:
-        verbosity: Console level (DEBUG, INFO, INFO:n, WARNING, ERROR, CRITICAL)
-        backend: Metrics backend to use ("wandb", "mlflow", or "none")
-        csv_path: Save metrics to CSV at this path (disabled if None)
-
-    Returns:
-        Logger instance
+    The arguments are used only when no instance exists yet: configure the
+    singleton before anything else logs, or the first caller's settings
+    win. :func:`reset_logger` clears it.
     """
-    global _default_logger
-    if _default_logger is None:
-        _default_logger = Logger(
-            verbosity=verbosity,
-            backend=backend,
-            csv_path=csv_path,
-        )
-    return _default_logger
+    global _LOGGER
+    if _LOGGER is None:
+        _LOGGER = Logger(backend=backend, verbosity=verbosity, csv_path=csv_path)
+    return _LOGGER
 
 
 def reset_logger() -> None:
-    """Reset the default logger instance. Useful for testing."""
-    global _default_logger
-    _default_logger = None
-
-
-def configure_backend(cfg: Config | None) -> MetricsBackend:
-    """Configure and return the logging backend from apeiron.config."""
-    if cfg is None or cfg.logging is None:
-        return "wandb"
-
-    backend = cfg.logging.backend
-
-    if backend not in ("wandb", "mlflow", "none"):
-        raise ValueError(f"Invalid logging backend: {backend}")
-
-    if backend == "mlflow" and cfg.logging.mlflow_tracking_uri:
-        import mlflow
-
-        mlflow.set_tracking_uri(cfg.logging.mlflow_tracking_uri)
-
-    return backend
+    """Drop the singleton so the next :func:`get_logger` rebuilds it."""
+    global _LOGGER
+    _LOGGER = None

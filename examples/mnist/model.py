@@ -54,8 +54,11 @@ class MNIST_CNN(BaseModelHarness):
       - get_hist_dataloaders():  build loaders over FULL train/val using the chained augmentations of all historical loades
     """
 
-    def __init__(self, cfg: Config, model: nn.Module = Cnn()):
-        super().__init__(cfg=cfg, model=model)
+    def __init__(self, cfg: Config, model: nn.Module | None = None):
+        # Built lazily, NOT as a default argument: `model = Cnn()` in the
+        # signature runs at import time and consumes the global RNG before
+        # any seed is set, shifting every later seeded draw (issue #129).
+        super().__init__(cfg=cfg, model=model if model is not None else Cnn())
 
         self.eval_metrics = {"accuracy": accuracy, "loss": self.get_criterion()}
         self.higher_is_better = {"accuracy": True, "loss": False}

@@ -1,294 +1,315 @@
-"""MLflow logging interface for metrics tracking."""
+"""MLflow metrics backend.
+
+Mirrors :class:`~apeiron.logger.wandb_logger.WandBLogger`'s interface, with
+three deliberate differences:
+
+* metric keys are namespaced with **dots** (``eval.acc``), because that is
+  how MLflow groups them;
+* metrics are logged against the **per-stage** step, so a sparse global
+  step cannot downsample away a rare ``drift.detected`` event;
+* booleans become ``0``/``1`` ints and non-numeric values are dropped,
+  because MLflow only accepts numbers.
+
+``mlflow`` itself is imported lazily into ``_mlflow`` so constructing the
+logger needs neither the package nor a tracking store.
+"""
 
 from __future__ import annotations
 
-import pandas as pd
-from dataclasses import asdict
+import dataclasses
 from pathlib import Path
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any
 
-from apeiron.logger.wandb_logger import StageType, VALID_STAGES
+from apeiron.logger.wandb_logger import VALID_STAGES, StageType
 
-if TYPE_CHECKING:
-    import mlflow
-    from apeiron.config.configuration import Config
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover - pandas is optional
+    pd = None  # type: ignore[assignment]
+
+#: MLflow rejects param values longer than this.
+MAX_PARAM_LENGTH = 500
+
+#: Default experiment name when a caller names none.
+DEFAULT_EXPERIMENT = "apeiron"
 
 
 class MLFlowLogger:
-    """MLflow metrics logger with stage-aware step tracking.
+    """Metrics backend writing to MLflow and/or a CSV.
 
-    Mirrors WandBLogger interface for drop-in replacement.
-    Tracks global `step` and per-stage steps (eval/step, drift/step, cl/step).
+    Parameters
+    ----------
+    enabled : bool
+        When false no run is started and nothing is sent.
+    csv_path : str | Path | None
+        Where :meth:`to_csv` writes. History is only retained when a path
+        is configured.
     """
 
-    def __init__(self, enabled: bool = True, csv_path: str | Path | None = None):
-        """Initialize MLflow logger.
+    def __init__(
+        self,
+        enabled: bool = True,
+        csv_path: str | Path | None = None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.csv_path: Path | None = Path(csv_path) if csv_path is not None else None
+        self.run: Any = None
 
-        Args:
-            enabled: Enable MLflow logging
-            csv_path: Save metrics to CSV at this path (disabled if None)
-        """
-        self.enabled = enabled
-        self.csv_path = Path(csv_path) if csv_path else None
-        self.run: mlflow.ActiveRun | None = None
+        self._mlflow: Any = None
+        self._step = 0
+        self._current_stage: str | None = None
+        self._stage_steps: dict[str, int] = {stage: 0 for stage in VALID_STAGES}
         self.metrics_history: list[dict[str, Any]] = []
 
-        # Step tracking
-        self._step = 0
-        self._stage_steps: dict[str, int] = {stage: 0 for stage in VALID_STAGES}
-        self._current_stage: StageType | None = None
-
-        # Lazy import mlflow
-        self._mlflow: Any = None
-
+    # ------------------------------------------------------------------
+    # lazy import
+    # ------------------------------------------------------------------
     def _get_mlflow(self) -> Any:
-        """Lazy import mlflow to avoid import errors when not installed."""
+        """Import ``mlflow`` on first use and cache the module."""
         if self._mlflow is None:
-            import mlflow
+            import mlflow  # imported here so construction stays cheap
 
             self._mlflow = mlflow
         return self._mlflow
 
+    # ------------------------------------------------------------------
+    # properties
+    # ------------------------------------------------------------------
     @property
     def step(self) -> int:
+        """The global step, incremented by every committing :meth:`log`."""
         return self._step
 
     @property
-    def current_stage(self) -> StageType | None:
+    def current_stage(self) -> str | None:
+        """The stage most recently named, or ``None``."""
         return self._current_stage
 
+    @property
+    def url(self) -> str | None:
+        """The run's web URL, or ``None`` for a local tracking store."""
+        if self.run is None:
+            return None
+        uri = str(self._get_mlflow().get_tracking_uri() or "")
+        if not uri.startswith(("http://", "https://")):
+            return None
+        info = getattr(self.run, "info", None)
+        if info is None:
+            return None
+        return (
+            f"{uri.rstrip('/')}/#/experiments/{info.experiment_id}"
+            f"/runs/{info.run_id}"
+        )
+
+    # ------------------------------------------------------------------
+    # stages
+    # ------------------------------------------------------------------
     def stage(self, name: StageType) -> None:
-        """Set current stage ('eval', 'drift', or 'cl')."""
+        """Select the stage subsequent metrics belong to."""
         if name not in VALID_STAGES:
-            raise ValueError(f"Invalid stage '{name}'. Must be one of: {VALID_STAGES}")
+            raise ValueError(
+                f"Invalid stage {name!r}; expected one of {list(VALID_STAGES)}"
+            )
         self._current_stage = name
 
     def get_stage_step(self, stage: StageType) -> int:
+        """The step counter for ``stage``; ``0`` for one never logged to."""
         return self._stage_steps.get(stage, 0)
 
+    # ------------------------------------------------------------------
+    # config flattening
+    # ------------------------------------------------------------------
+    def _flatten_config(self, config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+        """Flatten nested dicts into dot-separated keys."""
+        flat: dict[str, Any] = {}
+        for key, value in config.items():
+            name = f"{prefix}{key}"
+            if isinstance(value, dict):
+                flat.update(self._flatten_config(value, prefix=f"{name}."))
+            else:
+                flat[name] = value
+        return flat
+
+    # ------------------------------------------------------------------
+    # run lifecycle
+    # ------------------------------------------------------------------
     def init(
         self,
-        cfg: Config,
-        project: str = "basesim-framework",
+        cfg: Any,
+        project: str | None = None,
         name: str | None = None,
         tags: list[str] | None = None,
         notes: str | None = None,
         group: str | None = None,
-        **kwargs,
-    ) -> mlflow.ActiveRun | None:
-        """Initialize MLflow run with config.
-
-        Args:
-            cfg: Configuration object
-            project: MLflow experiment name
-            name: Run name
-            tags: List of tags
-            notes: Run description
-            group: Group name (stored as tag)
-            **kwargs: Additional arguments (ignored for MLflow compatibility)
-
-        Returns:
-            MLflow ActiveRun object or None if disabled
-        """
+        **kwargs: Any,
+    ) -> Any:
+        """Start a run against the configured tracking store, unless disabled."""
         if not self.enabled:
             return None
 
         mlflow = self._get_mlflow()
-
-        mlflow.set_experiment(project)
-
-        # Build tags dict
-        run_tags = {}
-        if group:
-            run_tags["group"] = group
-        if tags:
-            for i, tag in enumerate(tags):
-                run_tags[f"user_tag_{i}"] = tag
-
+        mlflow.set_experiment(project or DEFAULT_EXPERIMENT)
         mlflow.enable_system_metrics_logging()
-        self.run = mlflow.start_run(run_name=name, tags=run_tags if run_tags else None)
 
-        # Log config as params (flatten nested dataclass)
-        flat_config = self._flatten_config(asdict(cfg))
-        # MLflow params have a 500 char limit per value
-        truncated_config = {
-            k: str(v)[:500] if len(str(v)) > 500 else v for k, v in flat_config.items()
-        }
-        mlflow.log_params(truncated_config)
+        run_tags: dict[str, Any] = {}
+        if group is not None:
+            run_tags["group"] = group
+        for index, tag in enumerate(tags or []):
+            run_tags[f"user_tag_{index}"] = tag
+
+        self.run = mlflow.start_run(run_name=name, tags=run_tags or None)
 
         if notes:
             mlflow.set_tag("mlflow.note.content", notes)
 
+        params = self._flatten_config(_as_dict(cfg))
+        mlflow.log_params({k: _truncate(v) for k, v in params.items()})
         return self.run
 
-    def _flatten_config(self, d: dict, parent_key: str = "") -> dict:
-        """Flatten nested dict for MLflow params.
+    def finish(self, exit_code: int | None = None, save_csv: bool = True) -> Path | None:
+        """End the run, optionally writing the CSV first.
 
-        Args:
-            d: Dictionary to flatten
-            parent_key: Parent key prefix
-
-        Returns:
-            Flattened dictionary with dot-separated keys
+        A non-zero ``exit_code`` marks the run ``FAILED``.
         """
-        items: list[tuple[str, Any]] = []
-        for k, v in d.items():
-            new_key = f"{parent_key}.{k}" if parent_key else k
-            if isinstance(v, dict):
-                items.extend(self._flatten_config(v, new_key).items())
-            else:
-                items.append((new_key, v))
-        return dict(items)
+        written = self.to_csv() if save_csv else None
+        if self.enabled and self.run is not None:
+            mlflow = self._get_mlflow()
+            if exit_code:
+                mlflow.set_tag("mlflow.runStatus", "FAILED")
+            mlflow.end_run()
+            self.run = None
+        return written
 
+    # ------------------------------------------------------------------
+    # logging
+    # ------------------------------------------------------------------
     def log(
         self,
         metrics: dict[str, Any],
         step: int | None = None,
-        commit: bool = True,  # ignored, MLflow commits immediately
+        commit: bool = True,
         prefix: bool = True,
         increment: bool = True,
     ) -> None:
-        """Log metrics with auto-prefixing by current stage.
+        """Record one row of metrics.
 
-        Args:
-            metrics: Metric name/value pairs
-            step: Override global step (None = use internal counter)
-            commit: Ignored (MLflow commits immediately)
-            prefix: Auto-prefix metrics with current stage (skips keys with "/" or ".")
-            increment: Increment step counters
+        ``commit`` is accepted for interface parity with the wandb backend;
+        MLflow has no uncommitted row.
         """
         if increment:
             self._step += 1
             if self._current_stage:
-                self._stage_steps[self._current_stage] += 1
+                self._stage_steps[self._current_stage] = (
+                    self._stage_steps.get(self._current_stage, 0) + 1
+                )
 
-        current_step = step if step is not None else self._step
+        current_step = self._step if step is None else step
 
-        # Build prefixed metrics (MLflow uses dots, not slashes)
         prefixed_metrics: dict[str, Any] = {}
         for key, value in metrics.items():
-            if prefix and self._current_stage and "/" not in key and "." not in key:
-                prefixed_metrics[f"{self._current_stage}.{key}"] = value
+            dotted = key.replace("/", ".")
+            if prefix and self._current_stage and "." not in dotted:
+                prefixed_metrics[f"{self._current_stage}.{dotted}"] = value
             else:
-                # Convert slashes to dots for MLflow compatibility
-                prefixed_metrics[key.replace("/", ".")] = value
+                prefixed_metrics[dotted] = value
 
-        # Add step metrics
         prefixed_metrics["step"] = current_step
-        if self._current_stage and increment:
-            prefixed_metrics[f"{self._current_stage}.step"] = self._stage_steps[
-                self._current_stage
-            ]
+        if self._current_stage:
+            prefixed_metrics[f"{self._current_stage}.step"] = self._stage_steps.get(
+                self._current_stage, 0
+            )
 
-        # Save to history if CSV path provided
-        if self.csv_path:
-            self.metrics_history.append(prefixed_metrics.copy())
+        if self.csv_path is not None:
+            self.metrics_history.append(prefixed_metrics)
 
-        # Log to MLflow
-        if self.enabled and self.run:
-            mlflow = self._get_mlflow()
-            # Filter to only numeric values (MLflow only accepts numbers for metrics)
-            # Exclude bools: bool is a subclass of int in Python, but casting
-            # True/False to float(1.0/0.0) corrupts categorical semantics.
-            # Instead, booleans are converted to int (0/1) separately.
-            numeric_metrics = {
-                k: float(v)
-                for k, v in prefixed_metrics.items()
-                if isinstance(v, (int, float))
-                and not isinstance(v, bool)
-                and k != "step"
-            }
-            # Convert booleans to int (0/1) so they remain discrete metrics
-            bool_metrics = {
-                k: int(v) for k, v in prefixed_metrics.items() if isinstance(v, bool)
-            }
-            numeric_metrics.update(bool_metrics)
-            if numeric_metrics:
-                # WandB uses the global step as x-axis, however, MLflow uses the per-stage step so that
-                # sparse global-step values do not cause MLflow to downsample away the rare detected=1 events.
-                log_step = (
-                    self._stage_steps[self._current_stage]
-                    if self._current_stage
-                    else current_step
-                )
-                mlflow.log_metrics(numeric_metrics, step=log_step)
+        if not (self.enabled and self.run is not None):
+            return
+
+        numeric = {
+            key: _as_number(value)
+            for key, value in prefixed_metrics.items()
+            if key != "step" and _as_number(value) is not None
+        }
+        if not numeric:
+            return
+
+        # the per-stage step, so rare events are not downsampled away by a
+        # sparse global step
+        if step is not None:
+            logged_step = step
+        elif self._current_stage:
+            logged_step = self._stage_steps.get(self._current_stage, 0)
+        else:
+            logged_step = self._step
+        self._get_mlflow().log_metrics(numeric, step=logged_step)
 
     def save(
         self,
-        file_path: str | Path,
+        path: str | Path,
         base_path: str | Path | None = None,
-        policy: Literal["now", "live", "end"] = "now",
+        policy: str = "now",
     ) -> None:
-        """Save file as MLflow artifact.
+        """Log a file as a run artifact; a no-op without a run.
 
-        Args:
-            file_path: Path to file to save
-            base_path: Ignored (MLflow doesn't use base_path)
-            policy: Ignored (MLflow saves immediately)
+        ``base_path`` and ``policy`` exist for interface parity with the
+        wandb backend, which needs them.
         """
-        if self.enabled and self.run:
-            mlflow = self._get_mlflow()
-            mlflow.log_artifact(str(file_path))
+        if self.enabled and self.run is not None:
+            self._get_mlflow().log_artifact(str(path))
 
-    def to_dataframe(self) -> pd.DataFrame | None:
-        """Convert metrics to long-format DataFrame (step, metric, value)."""
-        if not self.metrics_history:
+    # ------------------------------------------------------------------
+    # records
+    # ------------------------------------------------------------------
+    def to_dataframe(self) -> Any:
+        """The recorded history in long format (``step``/``metric``/``value``)."""
+        if not self.metrics_history or pd is None:
             return None
-
-        rows = []
-        for entry in self.metrics_history:
-            step = entry.get("step")
-            for metric_name, value in entry.items():
-                if metric_name != "step":
-                    rows.append({"step": step, "metric": metric_name, "value": value})
-
-        return pd.DataFrame(rows)
+        rows = [
+            {"step": entry.get("step"), "metric": key, "value": value}
+            for entry in self.metrics_history
+            for key, value in entry.items()
+            if key != "step"
+        ]
+        if not rows:
+            return None
+        return pd.DataFrame(rows, columns=["step", "metric", "value"])
 
     def to_csv(self, csv_path: str | Path | None = None) -> Path | None:
-        """Save metrics to CSV in long format (step, metric, value)."""
-        df = self.to_dataframe()
-        if df is None:
+        """Write the history to ``csv_path`` or the configured path."""
+        target = csv_path if csv_path is not None else self.csv_path
+        if target is None:
             return None
-
-        output_path = Path(csv_path) if csv_path else self.csv_path
-        if output_path is None:
+        frame = self.to_dataframe()
+        if frame is None:
             return None
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(target, index=False)
+        return target
 
-        output_path.parent.mkdir(exist_ok=True, parents=True)
-        df.to_csv(output_path, index=False)
-        return output_path
 
-    def finish(
-        self, exit_code: int | None = None, save_csv: bool = True
-    ) -> Path | None:
-        """Finish MLflow run and optionally save CSV.
+def _as_dict(cfg: Any) -> dict[str, Any]:
+    """A config dataclass as a plain nested dict; a dict unchanged."""
+    if dataclasses.is_dataclass(cfg) and not isinstance(cfg, type):
+        return dataclasses.asdict(cfg)
+    return dict(cfg)
 
-        Args:
-            exit_code: Exit code (non-zero marks run as failed)
-            save_csv: Whether to save metrics to CSV
 
-        Returns:
-            Path to saved CSV or None
-        """
-        csv_path = self.to_csv() if save_csv and self.csv_path else None
+def _truncate(value: Any) -> Any:
+    """Clip over-long string params to MLflow's limit."""
+    if isinstance(value, str) and len(value) > MAX_PARAM_LENGTH:
+        return value[:MAX_PARAM_LENGTH]
+    return value
 
-        if self.enabled and self.run:
-            mlflow = self._get_mlflow()
-            if exit_code and exit_code != 0:
-                mlflow.set_tag("mlflow.runStatus", "FAILED")
-            mlflow.end_run()
-            self.run = None
 
-        return csv_path
+def _as_number(value: Any) -> int | float | None:
+    """A value MLflow can store, or ``None`` if it cannot.
 
-    @property
-    def url(self) -> str | None:
-        """Get URL to the MLflow run UI."""
-        if self.run:
-            mlflow = self._get_mlflow()
-            tracking_uri = mlflow.get_tracking_uri()
-            # Handle file:// URIs (local mlflow)
-            if tracking_uri.startswith("file://") or tracking_uri.startswith("/"):
-                return None
-            return f"{tracking_uri}/#/experiments/{self.run.info.experiment_id}/runs/{self.run.info.run_id}"
-        return None
+    Booleans become ints rather than being cast through float, so
+    ``detected`` reads back as ``1`` and not ``1.0``.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int) or isinstance(value, float):
+        return value
+    return None

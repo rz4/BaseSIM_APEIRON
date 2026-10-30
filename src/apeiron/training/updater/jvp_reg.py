@@ -1,117 +1,131 @@
-"""First-order SAM/Bertsimas robust updater for continual learning.
+"""A SAM-style robust update over the current and historical streams.
 
-Despite the historical ``jvp_reg`` name (and ``update_mode = "jvp_reg"``), this
-updater implements a first-order Sharpness-Aware / Bertsimas robust step rather
-than the original Jacobian-Vector-Product regularizer.
+Despite the module name the update is first-order: no Jacobian-vector product
+is formed. One step, given a current batch ``(x, y)`` and a historical batch
+``(xh, yh)``:
 
-The cost combines the current and historical batches into ONE loss (half/half,
-like base replay), and the robustness is the gradient of that combined loss at a
-parameter-perturbed point -- first-order only (no Hessian, no third order):
+1. The gradient of the loss on the **current batch only** is taken. The
+   historical batch does not enter this direction.
+2. The parameters are moved along the **negative**, normalised current
+   gradient -- a descent step of length ``jvp_rho_theta``, not an ascent one::
 
-    grad   = grad_theta  L_mix( theta + rho_theta * u_new ;  X_mix )
-    X_mix  = concat( X_cur[:n_cur],  X_hist[:n_hist] + rho_x * dx_hat )   (n_hist = n//2)
-    u_new  = -grad L_cur / ||grad L_cur||          (param direction -> new task)
-    dx_hat =  unit( mean(X_cur) - mean(X_hist) )   (batch-mean drift direction)
+       theta' = theta + jvp_rho_theta * (-g_cur / (||g_cur|| + 1e-12))
 
-Keeping the current batch inside the loss every step anchors the online accuracy
-so it cannot degrade. ``rho_x = 0`` reduces this to param-SAM only. Radii come
-from ``[continual_learning]``: ``jvp_rho_theta``, ``jvp_rho_x``, ``jvp_data_sign``.
+   with ``||g_cur||`` the single norm over all parameters at once.
+3. The historical inputs are shifted along the normalised, signed drift
+   direction between the two batches' means::
 
-Like the previous JVP updater, this manages the historical batch itself, so it is
-independent of the ``mix_historic_data`` replay flag.
+       d  = jvp_data_sign * (mean(x) - mean(xh));  d <- d / (||d|| + 1e-12)
+       xh <- xh + jvp_rho_x * d
+
+   ``jvp_rho_x = 0`` skips the shift.
+4. The backward pass is taken **at the perturbed point** over the half/half
+   mixed batch (the same mixing :class:`BaseUpdater` uses), and the parameters
+   are then restored exactly -- only ``.grad`` survives the call.
+
+With no historical batch there is nothing to be robust to, so the step is a
+plain current-only forward/backward and the reported forgetting loss is
+``0.0``. With one, ``update_post_fwd_bwd`` reports the mixed loss accumulated
+since the last report and resets it.
 """
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import torch
 
 from apeiron.config.configuration import Config
-from apeiron.model.torch_model_harness import BaseModelHarness
-from apeiron.training.updater.base import BaseUpdater
+from apeiron.training.updater.base import Batch, BaseUpdater
 
-_EPS = 1e-12
+#: Guards both normalisations against a vanishing direction.
+EPS = 1e-12
 
 
 class JVPRegUpdater(BaseUpdater):
-    """SAM-based robust updater on a combined current+historical batch."""
+    """First-order robust update: perturb, then differentiate the mixture."""
 
-    def __init__(self, cfg: Config, modelHarness: BaseModelHarness) -> None:
-        """Initialize the SAM-based updater with config and model harness."""
+    def __init__(self, cfg: Config, modelHarness) -> None:
         super().__init__(cfg, modelHarness)
-        self.rho_theta: float = cfg.continual_learning.jvp_rho_theta
-        self.rho_x: float = cfg.continual_learning.jvp_rho_x
-        # +1: perturb old inputs toward current dist (drift dir); -1: toward old
-        self.data_sign: float = cfg.continual_learning.jvp_data_sign
-        self.loss_mem: float = 0.0
+        cl = cfg.continual_learning
+        self.rho_theta = float(cl.jvp_rho_theta)
+        self.rho_x = float(cl.jvp_rho_x)
+        self.data_sign = float(cl.jvp_data_sign)
 
-    def _data_dir(self, x_cur: torch.Tensor, x_old: torch.Tensor) -> torch.Tensor:
-        """Unit batch-mean drift direction, broadcastable over the old batch."""
-        mc = x_cur.reshape(x_cur.shape[0], -1).mean(0)
-        mo = x_old.reshape(x_old.shape[0], -1).mean(0)
-        # +1 toward current (drift dir), -1 toward old
-        d = self.data_sign * (mc - mo)
-        d = d / (d.norm() + _EPS)
-        return d.reshape(x_old.shape[1:])  # e.g. [H, W], broadcasts over batch
+        #: The mixed loss accumulated since the last report.
+        self.loss_mem = 0.0
 
-    def fwd_bwd(
-        self,
-        batch: tuple[torch.Tensor, torch.Tensor],
-        hist_batch: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> float:
-        """Forward/backward for a single first-order SAM robust step.
+    # ------------------------------------------------------------------
+    def update_pre_fwd_bwd(self) -> None:
+        self.loss_mem = 0.0
 
-        With no historical batch this is a plain current-batch step. Otherwise it
-        combines both batches into one loss and back-propagates that loss at a
-        parameter-perturbed point (SAM). Parameters are always restored.
-        """
-        x, y = batch
-        A = self.cfg.train.grad_accumulation_steps
-        params = [p for p in self.model.parameters() if p.requires_grad]
+    def fwd_bwd(self, batch: Batch, hist_batch: Optional[Batch] = None) -> float:
+        x, y = self._unpack(batch)
+        self.model.train()
 
         if hist_batch is None:
-            # no history yet: plain current-batch step
-            loss = self.criterion(self.model(x), y) / A
+            loss = self.criterion(self.model(x), y) / self.grad_accumulation_steps
             loss.backward()
             return float(loss.item())
 
-        x_hist, y_hist = hist_batch
+        xh, yh = self._unpack(hist_batch)
+        params = self._trainable()
 
-        # u_new: current-task descent direction (SAM param-perturbation direction)
-        g_cur = torch.autograd.grad(self.criterion(self.model(x), y) / A, params)
-        sq = torch.stack([(g.detach() ** 2).sum() for g in g_cur]).sum()
-        gnorm = torch.sqrt(sq) + _EPS
-        u = [(-g.detach() / gnorm) for g in g_cur]
+        # 1. the current-only descent direction
+        loss_cur = self.criterion(self.model(x), y) / self.grad_accumulation_steps
+        g_cur = torch.autograd.grad(loss_cur, params)
+        g_norm = torch.sqrt(torch.stack([(g**2).sum() for g in g_cur]).sum()) + EPS
 
-        # --- COMBINE current + historical into ONE cost (half/half, like base replay) ---
-        # Keeps the current task inside the loss every step, so the online accuracy
-        # is anchored and cannot drift away.
-        n_total = x.shape[0]
-        n_hist = min(n_total // 2, x_hist.shape[0])
-        n_cur = n_total - n_hist
-        x_h = x_hist[:n_hist]
-        if self.rho_x != 0.0 and n_hist > 0:  # data shift on the historical portion
-            x_h = x_h + self.rho_x * self._data_dir(x, x_hist)
-        x_mix = torch.cat([x[:n_cur], x_h], dim=0)
-        y_mix = torch.cat([y[:n_cur], y_hist[:n_hist]], dim=0)
+        # 2. move there, remembering where we came from
+        original = [p.detach().clone() for p in params]
+        with torch.no_grad():
+            for param, grad in zip(params, g_cur):
+                param.add_(self.rho_theta * (-grad / g_norm))
 
-        # SAM: gradient of the COMBINED loss at the param-shifted point (first-order)
         try:
-            with torch.no_grad():
-                for p, ui in zip(params, u):
-                    p.add_(self.rho_theta * ui)
-            loss_mix = self.criterion(self.model(x_mix), y_mix) / A
+            # 3. + 4. differentiate the mixture at the perturbed point
+            x_mix, y_mix = self._perturbed_mix(x, y, xh, yh)
+            loss_mix = (
+                self.criterion(self.model(x_mix), y_mix) / self.grad_accumulation_steps
+            )
             loss_mix.backward()
+            value = float(loss_mix.item())
         finally:
-            with torch.no_grad():  # always restore params
-                for p, ui in zip(params, u):
-                    p.sub_(self.rho_theta * ui)
+            with torch.no_grad():
+                for param, saved in zip(params, original):
+                    param.copy_(saved)
 
-        self.loss_mem += float(loss_mix.item())
-        return float(loss_mix.item())
+        self.loss_mem += value
+        return value
 
-    @torch.no_grad()
     def update_post_fwd_bwd(self) -> float:
-        """Return the accumulated combined-loss value and reset it."""
-        lm = self.loss_mem
+        reported = float(self.loss_mem)
         self.loss_mem = 0.0
-        return lm
+        return reported
+
+    # ------------------------------------------------------------------
+    def _perturbed_mix(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        xh: torch.Tensor,
+        yh: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The half/half batch, with the historical half shifted by ``rho_x``."""
+        n_total = x.shape[0]
+        n_hist = min(n_total // 2, xh.shape[0])
+        n_cur = n_total - n_hist
+
+        x_hist = xh[:n_hist]
+        if self.rho_x != 0.0 and n_hist > 0:
+            direction = self.data_sign * (
+                x.reshape(x.shape[0], -1).mean(0)
+                - xh.reshape(xh.shape[0], -1).mean(0)
+            )
+            direction = direction / (direction.norm() + EPS)
+            x_hist = x_hist + self.rho_x * direction.reshape(xh.shape[1:])
+
+        return (
+            torch.cat([x[:n_cur], x_hist], dim=0),
+            torch.cat([y[:n_cur], yh[:n_hist]], dim=0),
+        )

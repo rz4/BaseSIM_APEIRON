@@ -1,21 +1,23 @@
+"""The null update: do nothing at all.
+
+Selected by ``update_mode = "none"``. Used to run the drift-detection and
+monitoring machinery without adapting the model, so the loss it reports is the
+sentinel ``-1.0`` rather than a measured number -- there was no pass to
+measure.
+"""
+
 from __future__ import annotations
 
+from typing import Optional
 
-from apeiron.training.updater.base import BaseUpdater
+from apeiron.training.updater.base import Batch, BaseUpdater
 
-import torch
+#: What :meth:`NoUpdater.fwd_bwd` reports in place of a training loss.
+NO_LOSS = -1.0
 
 
 class NoUpdater(BaseUpdater):
-    """No-op updater that skips training updates.
+    """Runs no forward/backward pass and leaves the gradients untouched."""
 
-    Used when continuous learning updates should be disabled.
-    """
-
-    def fwd_bwd(
-        self,
-        batch: tuple[torch.Tensor, torch.Tensor],
-        hist_batch: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> float:
-        """Skip forward/backward pass, return sentinel value."""
-        return -1.0
+    def fwd_bwd(self, batch: Batch, hist_batch: Optional[Batch] = None) -> float:
+        return NO_LOSS

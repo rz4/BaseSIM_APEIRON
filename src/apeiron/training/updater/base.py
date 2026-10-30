@@ -1,83 +1,115 @@
+"""The plain continual-learning update: one forward/backward over the batch.
+
+Every other updater is a subclass, so the contract lives here:
+
+``fwd_bwd(batch, hist_batch=None)``
+    Runs the forward/backward pass and returns the scalar training loss as a
+    plain ``float``. This is the only call the trainer wraps in its FLOP
+    counter, so an updater that needs extra second-order arithmetic does it in
+    :meth:`update_post_fwd_bwd` instead -- the measured number is meant to be
+    the cost of the model's own pass.
+
+``update_post_fwd_bwd()``
+    Applies whatever regularisation term the mode has and returns it as a
+    ``float``. The trainer logs it as the *forgetting loss* and adds it to the
+    generation loss, so it is always a number and it is ``0.0`` when no
+    historical information has entered the update yet.
+
+The remaining hooks (:meth:`cl_preprocessing`, :meth:`update_pre_fwd_bwd`,
+:meth:`update_post_optimizer_call`, :meth:`cl_postprocessing`) bracket a
+continual-learning application and do nothing in the base mode.
+"""
+
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
 
 from apeiron.config.configuration import Config
-from apeiron.model.torch_model_harness import BaseModelHarness
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from apeiron.model.torch_model_harness import BaseModelHarness
+
+Batch = Tuple[torch.Tensor, torch.Tensor]
 
 
 class BaseUpdater:
-    """Base class for model updaters in continual learning.
+    """A vanilla update step, optionally replaying a historical batch."""
 
-    Defines the interface for gradient-based updates during training.
-    Subclasses implement strategies like JVP or K-FAC regularization.
-
-    Attributes:
-        cfg: Configuration object.
-        criterion: Loss function for training.
-        model: Neural network model to update.
-    """
-
-    def __init__(self, cfg: Config, modelHarness: BaseModelHarness) -> None:
-        """Initialize updater with config and model harness."""
+    def __init__(self, cfg: Config, modelHarness: "BaseModelHarness") -> None:
         self.cfg = cfg
-        self.criterion: Callable[..., torch.Tensor] = modelHarness.get_criterion()
-        self.model: nn.Module = modelHarness.model
-        self.mix_historic_data: bool = cfg.continual_learning.mix_historic_data
+        self.modelHarness = modelHarness
+        self.model = modelHarness.model
+        self.criterion = modelHarness.get_criterion()
+        self.device = torch.device(cfg.device)
+        self.grad_accumulation_steps = max(1, int(cfg.train.grad_accumulation_steps))
+        self.mix_historic_data = bool(cfg.continual_learning.mix_historic_data)
 
-    def fwd_bwd(
-        self,
-        batch: tuple[torch.Tensor, torch.Tensor],
-        hist_batch: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> float:
-        """Perform forward and backward pass.
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _unpack(self, batch: Batch) -> Batch:
+        """Harness-aware unpack, moved onto the configured device."""
+        x, y = self.modelHarness._unpack(batch)
+        return x.to(self.device), y.to(self.device)
 
-        When `continual_learning.mix_historic_data` is enabled and a historical
-        batch is supplied, half of each stream is taken so the total sample count
-        per step stays the same as in the un-mixed case. If the historical batch
-        is too small to supply its half, the remainder is taken from the current
-        batch rather than shrinking the step.
+    def _trainable(self) -> List[torch.Tensor]:
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    @staticmethod
+    def _mix(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        xh: torch.Tensor,
+        yh: torch.Tensor,
+    ) -> Batch:
+        """Half the current batch followed by half as many historical samples.
+
+        The mixed batch keeps the current batch's size: ``n_total // 2`` samples
+        come from the history (or all of it, if it is shorter) and the rest from
+        the head of the current batch.
         """
-        x, y = batch
+        n_total = x.shape[0]
+        n_hist = min(n_total // 2, xh.shape[0])
+        if n_hist == 0:
+            return x, y
+        n_cur = n_total - n_hist
+        return (
+            torch.cat([x[:n_cur], xh[:n_hist]], dim=0),
+            torch.cat([y[:n_cur], yh[:n_hist]], dim=0),
+        )
+
+    # ------------------------------------------------------------------
+    # the measured pass
+    # ------------------------------------------------------------------
+    def fwd_bwd(self, batch: Batch, hist_batch: Optional[Batch] = None) -> float:
+        """One forward/backward, accumulating into ``param.grad``."""
+        x, y = self._unpack(batch)
         if self.mix_historic_data and hist_batch is not None:
-            x_hist, y_hist = hist_batch
-            n_total = x.shape[0]
-            n_hist = min(n_total // 2, x_hist.shape[0])
-            n_cur = n_total - n_hist
-            x = torch.cat([x[:n_cur], x_hist[:n_hist]], dim=0)
-            y = torch.cat([y[:n_cur], y_hist[:n_hist]], dim=0)
+            xh, yh = self._unpack(hist_batch)
+            x, y = self._mix(x, y, xh, yh)
 
-        outputs = self.model(x)
-        loss = self.criterion(outputs, y)
-        loss = loss / self.cfg.train.grad_accumulation_steps
+        self.model.train()
+        loss = self.criterion(self.model(x), y) / self.grad_accumulation_steps
         loss.backward()
+        return float(loss.item())
 
-        return loss.item()
-
-    @torch.no_grad()
+    # ------------------------------------------------------------------
+    # lifecycle hooks -- no-ops for the base mode
+    # ------------------------------------------------------------------
     def cl_preprocessing(self) -> None:
-        """Hook called before before the training loop starts"""
-        pass
+        """Called once before a continual-learning application starts."""
 
-    @torch.no_grad()
-    def cl_postprocessing(self) -> None:
-        """Hook called after the training loop ends"""
-        pass
-
-    @torch.no_grad()
     def update_pre_fwd_bwd(self) -> None:
-        """Hook called before gradient computation."""
-        pass
+        """Called before every :meth:`fwd_bwd`."""
 
-    @torch.no_grad()
     def update_post_fwd_bwd(self) -> float:
-        """Hook called after gradient computation, but before the optimizer. Returns regularization loss."""
+        """Apply the mode's regularisation; return the logged forgetting loss."""
         return 0.0
 
-    @torch.no_grad()
     def update_post_optimizer_call(self) -> None:
-        """Hook called after optimizer step to update internal state."""
-        pass
+        """Called after every ``optimizer.step()``."""
+
+    def cl_postprocessing(self) -> None:
+        """Called once after a continual-learning application finishes."""

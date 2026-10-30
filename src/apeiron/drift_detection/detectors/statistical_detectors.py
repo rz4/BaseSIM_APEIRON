@@ -1,316 +1,227 @@
+"""Statistical drift detectors, each a thin wrapper around a river detector.
+
+The wrapper's job is to turn river's per-step boolean into this layer's
+:class:`DriftSignal`: it keeps a drift history, averages it over a trailing
+window to get ``drift_score``, and maps that score onto the regime ladder.
+
+The averaging window differs per detector -- 100 samples for ADWIN, 50 for
+KSWIN and Page-Hinkley -- which is why a single detection scores 0.01 on the
+first and 0.02 on the other two.
 """
-Statistical drift detectors using river library.
 
-These detectors are lightweight, online algorithms suitable for streaming data.
-They monitor statistical properties of data streams to detect distribution shifts.
+from __future__ import annotations
 
-References:
-- river library: https://github.com/online-ml/river
-"""
+from typing import Any
 
-import numpy as np
-from river import drift as river_drift
-from apeiron.drift_detection.detectors.base import (
-    BaseDriftDetector,
-    DriftSignal,
-    LearningRegime,
-)
+from river import drift
+
+from apeiron.drift_detection.detectors.base import BaseDriftDetector
+from apeiron.drift_detection.detectors.base import DriftSignal
+from apeiron.drift_detection.detectors.base import LearningRegime
 
 
-class ADWINDetector(BaseDriftDetector):
+def _regime_for(
+    drift_detected: bool,
+    drift_score: float,
+    minor_threshold: float,
+    moderate_threshold: float,
+) -> LearningRegime:
+    """The ladder, as a plain if/elif chain.
+
+    ``minor_threshold`` is tested FIRST whatever its relation to
+    ``moderate_threshold``, and both comparisons are strict, so a score equal
+    to a threshold is not below it. An inverted pair therefore yields the
+    lightest response for a score under ``minor``, not the heaviest.
     """
-    Adaptive Windowing (ADWIN) drift detector.
+    if not drift_detected:
+        return LearningRegime.STABLE
+    if drift_score < minor_threshold:
+        return LearningRegime.CONTINUAL_LEARNING
+    if drift_score < moderate_threshold:
+        return LearningRegime.FINE_TUNING
+    return LearningRegime.RETRAIN
 
-    ADWIN maintains a variable-length sliding window and detects change when
-    there's a significant difference between the means of two sub-windows.
 
-    Best for: Detecting gradual and abrupt changes in mean values.
-    Use case: Monitor model loss, accuracy, or prediction errors over time.
+class _RiverDriftDetector(BaseDriftDetector):
+    """Shared machinery for the river-backed detectors.
+
+    Subclasses provide ``_SCORE_WINDOW``, build ``self.detector`` in
+    :meth:`_make_detector`, and describe themselves in :meth:`_metadata`.
     """
 
-    # The river detector carries ADWIN's variable-length window; the histories
-    # back the drift score. Together they are everything update() accumulates.
+    #: How many recent steps ``drift_score`` averages over.
+    _SCORE_WINDOW: int = 50
+
     _STATE_ATTRS = ("detector", "_drift_history", "_value_history")
+
+    def __init__(
+        self,
+        name: str,
+        minor_threshold: float = 0.3,
+        moderate_threshold: float = 0.6,
+    ):
+        super().__init__(name)
+        self.minor_threshold = minor_threshold
+        self.moderate_threshold = moderate_threshold
+        self.detector = self._make_detector()
+        self._is_initialized = True
+
+    def _make_detector(self) -> Any:
+        raise NotImplementedError(f"Method not implemented for {self.name}")
+
+    def _metadata(self, drift_score: float) -> dict[str, Any]:
+        return {}
+
+    def _confidence(self) -> float | None:
+        return None
+
+    def update(self, value: float, **kwargs) -> DriftSignal:
+        """Feed one metric value through the river detector."""
+        self._value_history.append(value)
+        self.detector.update(value)
+        drift_detected = bool(self.detector.drift_detected)
+        self._drift_history.append(1 if drift_detected else 0)
+
+        recent = self._drift_history[-self._SCORE_WINDOW :]
+        drift_score = sum(recent) / len(recent) if recent else 0.0
+
+        return DriftSignal(
+            regime=_regime_for(
+                drift_detected,
+                drift_score,
+                self.minor_threshold,
+                self.moderate_threshold,
+            ),
+            drift_detected=drift_detected,
+            drift_score=drift_score,
+            confidence=self._confidence(),
+            metadata=self._metadata(drift_score),
+        )
+
+    def reset(self) -> None:
+        """Rebuild the river detector and drop both histories."""
+        self.detector = self._make_detector()
+        self._drift_history = []
+        self._value_history = []
+
+
+class ADWINDetector(_RiverDriftDetector):
+    """ADWIN: adaptive windowing on the metric's mean."""
+
+    _SCORE_WINDOW = 100
 
     def __init__(
         self,
         delta: float = 0.002,
         minor_threshold: float = 0.3,
         moderate_threshold: float = 0.6,
-        name: str = "ADWIN",
     ):
-        """
-        Initialize ADWIN detector.
-
-        Args:
-            delta: Confidence level (lower = more sensitive, more false alarms)
-            minor_threshold: Drift score threshold for continual learning regime
-            moderate_threshold: Drift score threshold for fine-tuning regime
-            name: Detector name
-        """
-        super().__init__(name)
         self.delta = delta
-        self.minor_threshold = minor_threshold
-        self.moderate_threshold = moderate_threshold
-        self.detector = river_drift.ADWIN(delta=delta)
-        self._drift_history: list[int] = []
-        self._value_history: list[float] = []
-        self._is_initialized = True
+        super().__init__(
+            name="ADWIN",
+            minor_threshold=minor_threshold,
+            moderate_threshold=moderate_threshold,
+        )
 
-    def update(self, value: float, **kwargs) -> DriftSignal:
-        """
-        Update ADWIN with new value.
+    def _make_detector(self) -> Any:
+        return drift.ADWIN(delta=self.delta)
 
-        Args:
-            value: Metric to monitor (e.g., loss, error rate)
+    def _confidence(self) -> float | None:
+        return 1.0 - self.delta
 
-        Returns:
-            DriftSignal with regime recommendation
-        """
-        self._value_history.append(value)
-
-        # Update detector
-        self.detector.update(value)
-        drift_detected = self.detector.drift_detected
-
-        # Track drift occurrences
-        self._drift_history.append(1 if drift_detected else 0)
-
-        # Compute drift score based on recent drift frequency
-        recent_window = min(100, len(self._drift_history))
-        recent_drifts = self._drift_history[-recent_window:]
-        drift_score = np.mean(recent_drifts)
-
-        # Determine regime based on drift severity
-        if not drift_detected:
-            regime = LearningRegime.STABLE
-        elif drift_score < self.minor_threshold:
-            regime = LearningRegime.CONTINUAL_LEARNING
-        elif drift_score < self.moderate_threshold:
-            regime = LearningRegime.FINE_TUNING
-        else:
-            regime = LearningRegime.RETRAIN
-
-        metadata = {
-            "window_size": self.detector.width,
+    def _metadata(self, drift_score: float) -> dict[str, Any]:
+        return {
+            "window_size": getattr(self.detector, "width", None),
             "n_detections": sum(self._drift_history),
             "recent_drift_rate": drift_score,
         }
 
-        return DriftSignal(
-            regime=regime,
-            drift_detected=drift_detected,
-            drift_score=float(drift_score),
-            confidence=1 - self.delta,
-            metadata=metadata,
-        )
 
-    def reset(self) -> None:
-        """Reset detector to initial state."""
-        self.detector = river_drift.ADWIN(delta=self.delta)
-        self._drift_history = []
-        self._value_history = []
+class KSWINDetector(_RiverDriftDetector):
+    """KSWIN: a Kolmogorov-Smirnov test between a reference and a recent window.
 
-
-class KSWINDetector(BaseDriftDetector):
-    """
-    Kolmogorov-Smirnov Windowing (KSWIN) drift detector.
-
-    KSWIN uses the two-sample Kolmogorov-Smirnov test to compare recent data
-    against a reference window. Detects when distributions differ significantly.
-
-    Best for: Detecting changes in data distributions (not just mean).
-    Use case: Monitor prediction distributions, feature statistics.
+    River draws the reference window at random, so ``seed`` is what makes a run
+    reproducible from one process to the next. It defaults to ``None``, which
+    does not.
     """
 
-    # Pickling the river detector also captures its reference window and the
-    # RNG that drew it, so a resumed run samples exactly as it would have.
-    _STATE_ATTRS = ("detector", "_drift_history")
+    _SCORE_WINDOW = 50
 
     def __init__(
         self,
         alpha: float = 0.005,
         window_size: int = 100,
         stat_size: int = 30,
+        seed: int | None = None,
         minor_threshold: float = 0.3,
         moderate_threshold: float = 0.6,
-        name: str = "KSWIN",
-        seed: int | None = None,
     ):
-        """
-        Initialize KSWIN detector.
-
-        Args:
-            alpha: Significance level for KS test (lower = more sensitive)
-            window_size: Size of reference window
-            stat_size: Size of recent window for comparison
-            minor_threshold: Drift score threshold for continual learning
-            moderate_threshold: Drift score threshold for fine-tuning
-            name: Detector name
-            seed: Seed for KSWIN's reference-window sampling. KSWIN draws its
-                reference window at random, so runs are not reproducible unless
-                this is set.
-        """
-        super().__init__(name)
         self.alpha = alpha
         self.window_size = window_size
         self.stat_size = stat_size
-        self.minor_threshold = minor_threshold
-        self.moderate_threshold = moderate_threshold
         self.seed = seed
-        self.detector = river_drift.KSWIN(
-            alpha=alpha, window_size=window_size, stat_size=stat_size, seed=seed
-        )
-        self._drift_history: list[int] = []
-        self._is_initialized = True
-
-    def update(self, value: float, **kwargs) -> DriftSignal:
-        """
-        Update KSWIN with new value.
-
-        Args:
-            value: Metric to monitor
-
-        Returns:
-            DriftSignal with regime recommendation
-        """
-        self.detector.update(value)
-        drift_detected = self.detector.drift_detected
-
-        self._drift_history.append(1 if drift_detected else 0)
-
-        # Compute drift score
-        recent_window = min(50, len(self._drift_history))
-        recent_drifts = self._drift_history[-recent_window:]
-        drift_score = np.mean(recent_drifts)
-
-        # Determine regime
-        if not drift_detected:
-            regime = LearningRegime.STABLE
-        elif drift_score < self.minor_threshold:
-            regime = LearningRegime.CONTINUAL_LEARNING
-        elif drift_score < self.moderate_threshold:
-            regime = LearningRegime.FINE_TUNING
-        else:
-            regime = LearningRegime.RETRAIN
-
-        metadata = {
-            "p_value": getattr(self.detector, "p_value", None),
-            "n_detections": sum(self._drift_history),
-        }
-
-        return DriftSignal(
-            regime=regime,
-            drift_detected=drift_detected,
-            drift_score=float(drift_score),
-            confidence=1 - self.alpha,
-            metadata=metadata,
+        super().__init__(
+            name="KSWIN",
+            minor_threshold=minor_threshold,
+            moderate_threshold=moderate_threshold,
         )
 
-    def reset(self) -> None:
-        """Reset detector to initial state."""
-        self.detector = river_drift.KSWIN(
+    def _make_detector(self) -> Any:
+        return drift.KSWIN(
             alpha=self.alpha,
             window_size=self.window_size,
             stat_size=self.stat_size,
             seed=self.seed,
         )
-        self._drift_history = []
+
+    def _confidence(self) -> float | None:
+        return 1.0 - self.alpha
+
+    def _metadata(self, drift_score: float) -> dict[str, Any]:
+        return {
+            "window_size": self.window_size,
+            "stat_size": self.stat_size,
+            "n_detections": sum(self._drift_history),
+            "recent_drift_rate": drift_score,
+        }
 
 
-class PageHinkleyDetector(BaseDriftDetector):
-    """
-    Page-Hinkley test for drift detection.
+class PageHinkleyDetector(_RiverDriftDetector):
+    """Page-Hinkley: a cumulative-sum test on the metric's mean."""
 
-    Page-Hinkley detects changes in the mean of a Gaussian signal. It's fast
-    and works well for detecting abrupt changes.
-
-    Best for: Fast detection of abrupt changes in mean values.
-    Use case: Real-time monitoring of model performance metrics.
-    """
-
-    # The river detector holds the running mean and cumulative sum that the
-    # Page-Hinkley statistic is built from.
-    _STATE_ATTRS = ("detector", "_drift_history")
+    _SCORE_WINDOW = 50
 
     def __init__(
         self,
         min_instances: int = 30,
         delta: float = 0.005,
         threshold: float = 50.0,
-        alpha: float = 1 - 0.0001,
+        alpha: float = 0.9999,
         minor_threshold: float = 0.3,
         moderate_threshold: float = 0.6,
-        name: str = "PageHinkley",
     ):
-        """
-        Initialize Page-Hinkley detector.
-
-        Args:
-            min_instances: Minimum instances before detection
-            delta: Magnitude threshold for change
-            threshold: Detection threshold
-            alpha: Forgetting factor (weight of recent values)
-            minor_threshold: Drift score threshold for continual learning
-            moderate_threshold: Drift score threshold for fine-tuning
-            name: Detector name
-        """
-        super().__init__(name)
         self.min_instances = min_instances
         self.delta = delta
         self.threshold = threshold
         self.alpha = alpha
-        self.minor_threshold = minor_threshold
-        self.moderate_threshold = moderate_threshold
-        self.detector = river_drift.PageHinkley(
-            min_instances=min_instances, delta=delta, threshold=threshold, alpha=alpha
-        )
-        self._drift_history: list[int] = []
-        self._is_initialized = True
-
-    def update(self, value: float, **kwargs) -> DriftSignal:
-        """
-        Update Page-Hinkley test with new value.
-
-        Args:
-            value: Metric to monitor
-
-        Returns:
-            DriftSignal with regime recommendation
-        """
-        self.detector.update(value)
-        drift_detected = self.detector.drift_detected
-
-        self._drift_history.append(1 if drift_detected else 0)
-
-        # Compute drift score
-        recent_window = min(50, len(self._drift_history))
-        recent_drifts = self._drift_history[-recent_window:]
-        drift_score = np.mean(recent_drifts)
-
-        # Determine regime
-        if not drift_detected:
-            regime = LearningRegime.STABLE
-        elif drift_score < self.minor_threshold:
-            regime = LearningRegime.CONTINUAL_LEARNING
-        elif drift_score < self.moderate_threshold:
-            regime = LearningRegime.FINE_TUNING
-        else:
-            regime = LearningRegime.RETRAIN
-
-        return DriftSignal(
-            regime=regime,
-            drift_detected=drift_detected,
-            drift_score=float(drift_score),
-            metadata={"n_detections": sum(self._drift_history)},
+        super().__init__(
+            name="PageHinkley",
+            minor_threshold=minor_threshold,
+            moderate_threshold=moderate_threshold,
         )
 
-    def reset(self) -> None:
-        """Reset detector to initial state."""
-        self.detector = river_drift.PageHinkley(
+    def _make_detector(self) -> Any:
+        return drift.PageHinkley(
             min_instances=self.min_instances,
             delta=self.delta,
             threshold=self.threshold,
             alpha=self.alpha,
         )
-        self._drift_history = []
+
+    def _metadata(self, drift_score: float) -> dict[str, Any]:
+        return {
+            "threshold": self.threshold,
+            "min_instances": self.min_instances,
+            "n_detections": sum(self._drift_history),
+            "recent_drift_rate": drift_score,
+        }

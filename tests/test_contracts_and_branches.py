@@ -74,7 +74,9 @@ class TestHarnessContract:
 
         empty = TensorDataset(torch.empty(0, 4), torch.empty(0, dtype=torch.long))
         harness = make_harness(default_cfg, val_data=empty)
-        with pytest.raises(RuntimeError, match="Empty loader"):
+        # Match the condition, not the sentence: the exact wording is prose,
+        # and pinning it promotes a message to interface (claims/LOG.md A78).
+        with pytest.raises(RuntimeError, match="(?i)empty"):
             harness._eval_loader(DataLoader(empty, batch_size=4))
 
 

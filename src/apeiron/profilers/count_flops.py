@@ -1,392 +1,302 @@
-"""Compute performance using PyTorch FlopCounterMode with timing.
+"""FLOPs / throughput profiling for training and inference blocks.
 
-FlopCounterMode Limitations & Coverage:
-========================================
+The profiler wraps two different measurement strategies behind one store:
 
-COVERED OPERATIONS (with FLOP counting):
-- Linear layers (nn.Linear, F.linear): matmul + bias
-- Convolution (nn.Conv1d/2d/3d): conv operations
-- Matrix multiplication (torch.matmul, @, torch.mm, torch.bmm)
-- Element-wise ops: add, sub, mul, div (count as FLOPs)
-- Activation functions: ReLU, GELU, SiLU, etc. (counted as element-wise)
-- Normalization: LayerNorm, BatchNorm (counted)
-- Loss functions: CrossEntropyLoss, MSELoss (counted as element-wise + reductions)
+* :meth:`FLOPSProfiler.measure_flops` uses ``torch.utils.flop_counter``'s
+  ``FlopCounterMode``, which sees matmul/convolution style operations and
+  counts them with the usual ``2 * M * N * K`` convention.
+* :meth:`FLOPSProfiler.measure_flops_optimizer` covers the optimizer step,
+  which ``FlopCounterMode`` cannot see at all.  It runs a ``torch.profiler``
+  session, maps every observed ATen operation through
+  :data:`apeiron.profilers.aten_flops_map.ATEN_FLOPS_PER_ELEMENT` to get a
+  FLOPs-per-parameter-element figure, and scales it by the number of
+  trainable parameters.
 
-NOT COVERED or LIMITATIONS:
-- Indexing, slicing, reshape, transpose (NO FLOPs, just memory ops)
-- Custom autograd Functions - need explicit FLOP annotations
-- Some advanced operations - check flop_counter.py for full list
-Reference: https://github.com/pytorch/pytorch/blob/main/torch/utils/flop_counter.py
-
-- Relying on the accuracy of torch's flop_counter for general use.
-
-- Optimizers require FLOP estimation as flop_counter does not automatically count all non-module operations.
-- For profiling the optimizer step, user must measure_flops_optimizer(tag="opt", model=model, device=cfg.device).
-
-
+Both strategies append to ``profiles[tag]`` as ``{"flop": [...],
+"time": [...]}``, and :meth:`FLOPSProfiler.get_performance` reduces that
+store to a flat ``{tag}_flop`` / ``{tag}_time`` / ``{tag}_flops`` dict whose
+keys become metric-CSV columns.
 """
 
-# -
-import time
-import pandas as pd
-from contextlib import contextmanager
-from typing import Dict, List, Optional, Generator
+from __future__ import annotations
 
-import torch.nn as nn
-from torch.profiler import profile, ProfilerActivity
-from torch.utils.flop_counter import FlopCounterMode
+import time
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
+
+import torch
 
 from apeiron.profilers.aten_flops_map import ATEN_FLOPS_PER_ELEMENT
 
+__all__ = ["FLOPSProfiler"]
 
-# -
+
 class FLOPSProfiler:
-    """Profiler for measuring FLOPs and execution time of PyTorch operations.
+    """Collects FLOP counts and wall-clock durations for tagged blocks.
 
-    This class uses PyTorch's FlopCounterMode to automatically count FLOPs for
-    most operations. For optimizer steps, use measure_flops_optimizer() which
-    employs torch.profiler for accurate FLOP estimation.
-
-    Attributes:
-        warmup_iters: Number of warmup iterations before profiling
-        profiles: Dictionary storing FLOP and time measurements per tag
-        tag: Current measurement tag (set during active profiling)
-        start_time: Start time of current measurement
-        flop_counter: FlopCounterMode instance for current measurement
+    Args:
+        warmup_iters: Number of warm-up iterations a caller is expected to
+            run before the figures are considered representative.  Kept as
+            state so callers and reports can agree on it; measurements are
+            always recorded.
     """
 
-    def __init__(
-        self,
-        warmup_iters: int = 1,
-    ) -> None:
-        """Initialize the FLOPSProfiler.
-
-        Args:
-            warmup_iters: Number of warmup iterations (default: 1)
-        """
-        self.warmup_iters: int = warmup_iters
+    def __init__(self, warmup_iters: int = 1) -> None:
+        self.warmup_iters = warmup_iters
+        self.profiles: Dict[str, Dict[str, List[Any]]] = {}
         self.tag: Optional[str] = None
         self.start_time: Optional[float] = None
-        self.flop_counter: Optional[FlopCounterMode] = None
-        self.profiles: Dict[str, Dict[str, List[float]]] = {}
 
+    # ------------------------------------------------------------------
+    # store
+    # ------------------------------------------------------------------
+    def _record(self, tag: str, flop: Any, elapsed: float) -> None:
+        record = self.profiles.setdefault(tag, {"flop": [], "time": []})
+        record["flop"].append(flop)
+        record["time"].append(elapsed)
+
+    # ------------------------------------------------------------------
+    # measurement
+    # ------------------------------------------------------------------
     @contextmanager
-    def measure_flops(
-        self, tag: str = "default"
-    ) -> Generator["FLOPSProfiler", None, None]:
-        """Context manager for measuring FLOPs and time for a code block.
-
-        Uses FlopCounterMode to automatically count FLOPs for supported operations.
-        Best for forward/backward passes of neural network modules.
+    def measure_flops(self, tag: str = "default") -> Iterator[None]:
+        """Measure the FLOPs and duration of the wrapped block.
 
         Args:
-            tag: Identifier for this measurement session (default: "default")
-
-        Yields:
-            self: The profiler instance
-
-        Example:
-            >>> profiler = FLOPSProfiler()
-            >>> with profiler.measure_flops("forward"):
-            ...     output = model(input)
+            tag: Name the measurement is recorded under.  Repeated use of
+                the same tag accumulates measurements, which
+                :meth:`get_performance` averages.
         """
+        from torch.utils.flop_counter import FlopCounterMode
+
         self.tag = tag
-        if self.tag not in self.profiles:
-            self._add_profile(self.tag)
-
-        self.flop_counter = FlopCounterMode(display=False, depth=None)  # type: ignore[arg-type]
-        self.flop_counter.__enter__()
         self.start_time = time.perf_counter()
-
+        counter = FlopCounterMode(display=False)
+        flop = 0
         try:
-            yield self
+            try:
+                with counter:
+                    yield
+                flop = int(counter.get_total_flops())
+            finally:
+                elapsed = time.perf_counter() - (
+                    self.start_time
+                    if self.start_time is not None
+                    else time.perf_counter()
+                )
+                self._record(tag, flop, elapsed)
         finally:
-            elapsed_time = time.perf_counter() - self.start_time
-            total_flops = self.flop_counter.get_total_flops()
-            self.flop_counter.__exit__(None, None, None)
-
-            # Combine automatic and manual FLOPs
-            self.profiles[self.tag]["flop"].append(total_flops)
-            self.profiles[self.tag]["time"].append(elapsed_time)
-
             self.tag = None
             self.start_time = None
-            self.flop_counter = None
 
     @contextmanager
     def measure_flops_optimizer(
-        self, model: nn.Module, device: str, tag: str = "optimizer"
-    ) -> Generator["FLOPSProfiler", None, None]:
-        """Context manager for measuring FLOPs and time for optimizer step.
+        self,
+        model: Any,
+        device: Any,
+        tag: str = "optimizer",
+    ) -> Iterator[None]:
+        """Measure an optimizer step, which ``FlopCounterMode`` cannot see.
 
-        Uses torch.profiler to estimate FLOPs for optimizer operations,
-        which are not captured by FlopCounterMode. Estimates total FLOPs by
-        multiplying per-element operations by the number of trainable parameters.
+        Total FLOPs are estimated as (FLOPs per parameter element) x
+        (number of trainable parameters), where the per-element figure comes
+        from mapping the observed ATen operations through
+        ``ATEN_FLOPS_PER_ELEMENT``.
 
         Args:
-            model: The model being optimized (used to count parameters)
-            device: Device type ('cuda' or 'cpu')
-            tag: Identifier for this measurement session (default: "optimizer")
-
-        Yields:
-            self: The profiler instance
-
-        Example:
-            >>> profiler = FLOPSProfiler()
-            >>> with profiler.measure_flops_optimizer(model, "cuda", "optimizer"):
-            ...     optimizer.step()
+            model: Module whose trainable parameters the estimate scales by.
+            device: Device the step runs on; selects the profiler activities.
+            tag: Name the measurement is recorded under.
         """
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if "cuda" in str(device).lower() and torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
         self.tag = tag
-        if self.tag not in self.profiles:
-            self._add_profile(self.tag)
-
         self.start_time = time.perf_counter()
-
-        # Use torch profiler for optimizer operations
-        with profile(
-            activities=(
-                [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-                if device == "cuda"
-                else [ProfilerActivity.CPU]
-            ),
-            with_flops=True,
-            record_shapes=True,
-            profile_memory=True,
-        ) as prof:
+        flop = 0
+        try:
             try:
-                yield self
+                with torch.profiler.profile(
+                    activities=activities, record_shapes=True, with_flops=True
+                ) as prof:
+                    yield
+                per_element = self._estimate_flops_per_elem(prof)
+                n_params = sum(
+                    p.numel() for p in model.parameters() if p.requires_grad
+                )
+                flop = int(per_element) * int(n_params)
             finally:
-                pass
+                elapsed = time.perf_counter() - (
+                    self.start_time
+                    if self.start_time is not None
+                    else time.perf_counter()
+                )
+                self._record(tag, flop, elapsed)
+        finally:
+            self.tag = None
+            self.start_time = None
 
-        elapsed_time = time.perf_counter() - self.start_time
+    # ------------------------------------------------------------------
+    # ATen based estimate
+    # ------------------------------------------------------------------
+    def _estimate_flops_per_elem(self, prof: Any, debug: bool = False) -> int:
+        """FLOPs per parameter element implied by a profiler session.
 
-        # Estimate FLOPs using the profiler
-        flops_per_elem = self._estimate_flops_per_elem(prof)
-        total_params_require_grad = sum(
-            p.numel() for p in model.parameters() if p.requires_grad
-        )
-        total_flops = flops_per_elem * total_params_require_grad
-
-        self.profiles[self.tag]["flop"].append(total_flops)
-        self.profiles[self.tag]["time"].append(elapsed_time)
-
-        self.tag = None
-        self.start_time = None
-
-    def _add_profile(self, tag: str) -> None:
-        """Initialize a new profile entry for a given tag.
-
-        Args:
-            tag: Identifier for the profile entry
-        """
-        self.profiles[tag] = {}
-        self.profiles[tag]["flop"] = []
-        self.profiles[tag]["time"] = []
-
-    def _estimate_flops_per_elem(self, prof: profile, debug: bool = False) -> int:
-        """Estimate FLOPs per parameter element from profiler data.
-
-        Analyzes torch.profiler events to estimate FLOPs per parameter by mapping
-        ATen operations to their FLOP counts and multiplying by call counts.
+        Every ATen operation the session observed is looked up in
+        ``ATEN_FLOPS_PER_ELEMENT``; known entries contribute
+        ``flops_per_element * call_count``.  Operations that are absent, or
+        whose cost needs dimension-specific formulas (``None`` in the table),
+        contribute nothing.
 
         Args:
-            prof: torch.profiler.profile instance with recorded operations
-            debug: If True, print detailed profiling information (default: False)
+            prof: Anything exposing ``key_averages()``.
+            debug: Print the per-operation breakdown.
 
         Returns:
-            Estimated FLOPs per parameter element
+            Estimated FLOPs per parameter element.
         """
-        # Get aggregated statistics
-        events = prof.key_averages()
+        rows = []
+        total = 0
+        for event in prof.key_averages():
+            key = getattr(event, "key", None)
+            count = int(getattr(event, "count", 0) or 0)
+            per_element = ATEN_FLOPS_PER_ELEMENT.get(key)
+            contribution = 0
+            if per_element is not None:
+                contribution = int(per_element) * count
+                total += contribution
+            rows.append((key, count, per_element, contribution))
 
-        # Extract data into lists
-        data = []
-        for event in events:
-            data.append(
-                {
-                    "operation": event.key,
-                    "flops": event.flops,
-                    "count": event.count,
-                    "cpu_time_us": event.cpu_time_total,
-                    "cpu_time_ms": event.cpu_time_total / 1000,
-                    "cuda_time_us": (
-                        event.cuda_time_total
-                        if hasattr(event, "cuda_time_total")
-                        else 0
-                    ),
-                    "self_cpu_time_us": event.self_cpu_time_total,
-                    "input_shapes": (
-                        str(event.input_shapes) if event.input_shapes else ""
-                    ),
-                }
-            )
-
-        if not data:
-            return 0
-
-        df = pd.DataFrame(data)
-        # Multiply FLOPs per element by the number of times each operation was called
-        df["est_flops_per_param"] = df.apply(
-            lambda row: ATEN_FLOPS_PER_ELEMENT.get(row.operation, 0) * row["count"],
-            axis=1,
-        )
-
-        # - Profiler Probe
-        # - May need to look here later to see if there are any missing computations in the lookup.
         if debug:
-            df = df.sort_values("self_cpu_time_us", ascending=False).reset_index(
-                drop=True
+            print("=" * 80)
+            print("All Function Calls")
+            print("=" * 80)
+            print(
+                f"{'operation':<40} {'calls':>7} {'flop/elem':>10} "
+                f"{'subtotal':>12}"
             )
-            print("All Function Calls:\n", df)
-            print("Compute Function Calls:\n", df[df.est_flops_per_param > 0])
-            print("Estimated FLOPs per param:", int(df.est_flops_per_param.sum()))
+            print("-" * 80)
+            for key, count, per_element, contribution in rows:
+                shown = "n/a" if per_element is None else str(per_element)
+                print(f"{str(key):<40} {count:>7} {shown:>10} {contribution:>12}")
+            print("-" * 80)
+            print(f"Estimated FLOPs per param element: {total}")
+            print("=" * 80)
 
-        # -
-        return int(df.est_flops_per_param.sum())
+        return total
 
+    # ------------------------------------------------------------------
+    # reporting
+    # ------------------------------------------------------------------
     def get_performance(self) -> Dict[str, float]:
-        """Calculate average performance metrics across all measurements.
-
-        Computes the mean FLOPs, time, and throughput (FLOP/s) for each tag.
+        """Average FLOPs, duration and throughput per tag.
 
         Returns:
-            Dictionary containing averaged metrics with keys:
-                - {tag}_flop: Average FLOPs per operation
-                - {tag}_time: Average time per operation (seconds)
-                - {tag}_flops: Average throughput (FLOP/s)
+            Flat dict with ``{tag}_flop`` (count), ``{tag}_time`` (seconds)
+            and ``{tag}_flops`` (throughput) for every recorded tag.  All
+            values are floats, since each one becomes a metric-CSV cell.
         """
-        perf = {}
-        for tag in self.profiles:
-            flop_ = self.profiles[tag]["flop"]
-            time_ = self.profiles[tag]["time"]
-            avg_flop_ = sum(flop_) / len(flop_)
-            avg_time_ = sum(time_) / len(time_)
-            perf[f"{tag}_flop"] = avg_flop_
-            perf[f"{tag}_time"] = avg_time_
-            perf[f"{tag}_flops"] = avg_flop_ / avg_time_
+        performance: Dict[str, float] = {}
+        for tag, record in self.profiles.items():
+            flops = record["flop"]
+            times = record["time"]
+            if not flops or not times:
+                continue
+            avg_flop = float(sum(flops)) / len(flops)
+            avg_time = float(sum(times)) / len(times)
+            performance[f"{tag}_flop"] = avg_flop
+            performance[f"{tag}_time"] = avg_time
+            performance[f"{tag}_flops"] = (
+                avg_flop / avg_time if avg_time > 0 else 0.0
+            )
+        return performance
 
-        return perf
-
-    def _format_flops(self, flops: float) -> str:
-        """Format FLOPs in human-readable form.
-
-        Args:
-            flops: Number of FLOPs to format
-
-        Returns:
-            Formatted string with appropriate unit (TFLOPs, GFLOPs, MFLOPs, KFLOPs, or FLOPs)
-        """
-        if flops >= 1e12:
-            return f"{flops / 1e12:.2f} TFLOPs"
-        elif flops >= 1e9:
-            return f"{flops / 1e9:.2f} GFLOPs"
-        elif flops >= 1e6:
-            return f"{flops / 1e6:.2f} MFLOPs"
-        elif flops >= 1e3:
-            return f"{flops / 1e3:.2f} KFLOPs"
-        else:
-            return f"{flops:.0f} FLOPs"
-
-    def _format_time(self, time_sec: float) -> str:
-        """Format time in human-readable form.
-
-        Args:
-            time_sec: Time in seconds
-
-        Returns:
-            Formatted string with appropriate unit (s, ms, μs, or ns)
-        """
-        if time_sec >= 1.0:
-            return f"{time_sec:.4f} s"
-        elif time_sec >= 1e-3:
-            return f"{time_sec * 1e3:.2f} ms"
-        elif time_sec >= 1e-6:
-            return f"{time_sec * 1e6:.2f} μs"
-        else:
-            return f"{time_sec * 1e9:.2f} ns"
-
-    def _format_throughput(self, flops_per_sec: float) -> str:
-        """Format throughput (FLOP/s) in human-readable form.
-
-        Args:
-            flops_per_sec: Throughput in FLOPs per second
-
-        Returns:
-            Formatted string with appropriate unit (TFLOP/s, GFLOP/s, MFLOP/s, KFLOP/s, or FLOP/s)
-        """
-        if flops_per_sec >= 1e12:
-            return f"{flops_per_sec / 1e12:.2f} TFLOP/s"
-        elif flops_per_sec >= 1e9:
-            return f"{flops_per_sec / 1e9:.2f} GFLOP/s"
-        elif flops_per_sec >= 1e6:
-            return f"{flops_per_sec / 1e6:.2f} MFLOP/s"
-        elif flops_per_sec >= 1e3:
-            return f"{flops_per_sec / 1e3:.2f} KFLOP/s"
-        else:
-            return f"{flops_per_sec:.0f} FLOP/s"
-
-    def print_performance(self, logger=None, level: int = 0) -> None:
-        """Pretty print the performance metrics (averaged per update).
-
-        Displays a formatted table showing FLOPs, time, and throughput for each
-        profiled operation tag, along with totals.
+    def print_performance(self, logger: Any = None, level: int = 0) -> None:
+        """Print a human-readable summary of the collected measurements.
 
         Args:
             logger: Optional logger instance. If provided, uses logger.info().
-                    If None, falls back to print() for backward compatibility.
-            level: Verbosity level for logging (default: 0). Only used when logger is provided.
-                   Higher values are more verbose (e.g., level=1 for INFO:1, level=2 for INFO:2).
+                If None, falls back to print() for backward compatibility.
+            level: Verbosity level for logging (default: 0). Only used when
+                logger is provided.
         """
-        perf = self.get_performance()
-
         output_fn = (lambda msg: logger.info(msg, level=level)) if logger else print
 
-        if not perf:
-            output_fn("No performance data collected yet.")
+        performance = self.get_performance()
+        if not performance:
+            output_fn("No performance data collected.")
             return
 
-        # Extract unique tags
-        tags = sorted(set(key.rsplit("_", 1)[0] for key in perf.keys()))
+        total_flop = 0.0
+        total_time = 0.0
 
-        # Print header
-        output_fn("-" * 75)
-        output_fn("Compute Performance Metrics (Averaged per Update)")
-        output_fn("-" * 75)
-        output_fn(f"{'Operation':<15} {'FLOPs':<18} {'Time':<15} {'Throughput':<20}")
-        output_fn("-" * 75)
-
-        # Track totals
-        total_flops: float = 0
-        total_time: float = 0
-
-        # Print each tag's metrics
-        for tag in tags:
-            flop_key = f"{tag}_flop"
-            time_key = f"{tag}_time"
-            flops_key = f"{tag}_flops"
-
-            if flop_key in perf and time_key in perf and flops_key in perf:
-                flop_str = self._format_flops(perf[flop_key])
-                time_str = self._format_time(perf[time_key])
-                throughput_str = self._format_throughput(perf[flops_key])
-
-                output_fn(
-                    f"{tag:<15} {flop_str:<18} {time_str:<15} {throughput_str:<20}"
-                )
-
-                total_flops += perf[flop_key]
-                total_time += perf[time_key]
-
-        # Print total row
-        if total_flops > 0 and total_time > 0:
-            output_fn("-" * 75)
-            total_throughput = total_flops / total_time
-            total_flop_str = self._format_flops(total_flops)
-            total_time_str = self._format_time(total_time)
-            total_throughput_str = self._format_throughput(total_throughput)
-
+        output_fn("=" * 72)
+        output_fn("FLOPS PROFILER PERFORMANCE")
+        output_fn("=" * 72)
+        output_fn(f"{'tag':<24} {'FLOPs':>14} {'time':>12} {'throughput':>18}")
+        output_fn("-" * 72)
+        for tag in self.profiles:
+            if f"{tag}_flop" not in performance:
+                continue
+            flop = performance[f"{tag}_flop"]
+            elapsed = performance[f"{tag}_time"]
+            throughput = performance[f"{tag}_flops"]
+            total_flop += flop
+            total_time += elapsed
             output_fn(
-                f"{'TOTAL':<15} {total_flop_str:<18} {total_time_str:<15} {total_throughput_str:<20}"
+                f"{tag:<24} {self._format_flops(flop):>14} "
+                f"{self._format_time(elapsed):>12} "
+                f"{self._format_throughput(throughput):>18}"
             )
+        output_fn("-" * 72)
+        total_throughput = total_flop / total_time if total_time > 0 else 0.0
+        output_fn(
+            f"{'TOTAL':<24} {self._format_flops(total_flop):>14} "
+            f"{self._format_time(total_time):>12} "
+            f"{self._format_throughput(total_throughput):>18}"
+        )
+        output_fn("=" * 72)
 
-        output_fn("-" * 75)
+    # ------------------------------------------------------------------
+    # formatting helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _format_flops(flops: float) -> str:
+        """Format a FLOP count with an SI-style unit."""
+        flops = float(flops)
+        if abs(flops) >= 1e12:
+            return f"{flops / 1e12:.2f} TFLOPs"
+        if abs(flops) >= 1e9:
+            return f"{flops / 1e9:.2f} GFLOPs"
+        if abs(flops) >= 1e6:
+            return f"{flops / 1e6:.2f} MFLOPs"
+        if abs(flops) >= 1e3:
+            return f"{flops / 1e3:.2f} KFLOPs"
+        return f"{flops:.2f} FLOPs"
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        """Format a duration with an SI-style unit."""
+        seconds = float(seconds)
+        if abs(seconds) >= 1.0:
+            return f"{seconds:.2f} s"
+        if abs(seconds) >= 1e-3:
+            return f"{seconds * 1e3:.2f} ms"
+        if abs(seconds) >= 1e-6:
+            return f"{seconds * 1e6:.2f} μs"
+        return f"{seconds * 1e9:.2f} ns"
+
+    @staticmethod
+    def _format_throughput(flops_per_second: float) -> str:
+        """Format a throughput with an SI-style unit."""
+        rate = float(flops_per_second)
+        if abs(rate) >= 1e12:
+            return f"{rate / 1e12:.2f} TFLOP/s"
+        if abs(rate) >= 1e9:
+            return f"{rate / 1e9:.2f} GFLOP/s"
+        if abs(rate) >= 1e6:
+            return f"{rate / 1e6:.2f} MFLOP/s"
+        if abs(rate) >= 1e3:
+            return f"{rate / 1e3:.2f} KFLOP/s"
+        return f"{rate:.2f} FLOP/s"

@@ -1,97 +1,97 @@
+"""The factory that turns ``[drift_detection]`` config into a detector.
+
+One entry point, :func:`load_drift_detector`, so the rest of the framework
+never names a detector class: the config does.
+"""
+
+from __future__ import annotations
+
 from apeiron.config.configuration import Config
+from apeiron.config.configuration import DriftDetectionCfg
 from apeiron.drift_detection.detectors.base import BaseDriftDetector
+from apeiron.drift_detection.detectors.model_performance_detector import (
+    EnsembleDetector,
+)
+from apeiron.drift_detection.detectors.model_performance_detector import (
+    ModelEvalDetector,
+)
+from apeiron.drift_detection.detectors.model_performance_detector import (
+    ModelPerformanceDetector,
+)
+from apeiron.drift_detection.detectors.statistical_detectors import ADWINDetector
+from apeiron.drift_detection.detectors.statistical_detectors import KSWINDetector
+from apeiron.drift_detection.detectors.statistical_detectors import (
+    PageHinkleyDetector,
+)
+
+#: The config name of the ensemble, which cannot appear among its own members.
+ENSEMBLE_NAME = "EnsembleDetector"
 
 
-def _build_detector(detector_name: str, cfg: Config) -> BaseDriftDetector:
-    """Instantiate a single (non-ensemble) drift detector from the config.
-
-    Args:
-        detector_name (str): Name of the drift detector class to build.
-        cfg: Configuration object containing parameters for the detector.
-
-    Returns:
-        BaseDriftDetector: An instance of the specified drift detector.
-    """
-    detector_instance: BaseDriftDetector
-    if detector_name == "ADWINDetector":
-        from apeiron.drift_detection.detectors.statistical_detectors import (
-            ADWINDetector,
+def _build_simple(name: str, cfg: DriftDetectionCfg) -> BaseDriftDetector:
+    """Build one non-ensemble detector from the drift-detection config."""
+    if name == "ADWINDetector":
+        return ADWINDetector(
+            delta=cfg.adwin_delta,
+            minor_threshold=cfg.adwin_minor_threshold,
+            moderate_threshold=cfg.adwin_moderate_threshold,
         )
-
-        detector_instance = ADWINDetector(
-            delta=cfg.drift_detection.adwin_delta,
-            minor_threshold=cfg.drift_detection.adwin_minor_threshold,
-            moderate_threshold=cfg.drift_detection.adwin_moderate_threshold,
+    if name == "KSWINDetector":
+        return KSWINDetector(
+            alpha=cfg.kswin_alpha,
+            window_size=cfg.kswin_window_size,
+            stat_size=cfg.kswin_stat_size,
+            seed=cfg.kswin_seed,
         )
-    elif detector_name == "KSWINDetector":
-        from apeiron.drift_detection.detectors.statistical_detectors import (
-            KSWINDetector,
+    if name == "PageHinkleyDetector":
+        return PageHinkleyDetector(
+            min_instances=cfg.ph_min_instances,
+            delta=cfg.ph_delta,
+            threshold=cfg.ph_threshold,
+            alpha=cfg.ph_alpha,
         )
-
-        detector_instance = KSWINDetector(
-            alpha=cfg.drift_detection.kswin_alpha,
-            window_size=cfg.drift_detection.kswin_window_size,
-            stat_size=cfg.drift_detection.kswin_stat_size,
-            seed=cfg.drift_detection.kswin_seed,
-        )
-    elif detector_name == "PageHinkleyDetector":
-        from apeiron.drift_detection.detectors.statistical_detectors import (
-            PageHinkleyDetector,
-        )
-
-        detector_instance = PageHinkleyDetector(
-            min_instances=cfg.drift_detection.ph_min_instances,
-            delta=cfg.drift_detection.ph_delta,
-            threshold=cfg.drift_detection.ph_threshold,
-            alpha=cfg.drift_detection.ph_alpha,
-        )
-    elif detector_name == "ModelPerformanceDetector":
-        from apeiron.drift_detection.detectors.model_performance_detector import (
-            ModelPerformanceDetector,
-        )
-
-        detector_instance = ModelPerformanceDetector()
-    elif detector_name == "EvalDetector":
-        from apeiron.drift_detection.detectors.model_performance_detector import (
-            ModelEvalDetector,
-        )
-
-        detector_instance = ModelEvalDetector()
-    else:
-        raise ValueError(f"Unknown drift detector: {detector_name}")
-
-    return detector_instance
+    if name == "ModelPerformanceDetector":
+        return ModelPerformanceDetector()
+    if name == "EvalDetector":
+        return ModelEvalDetector()
+    raise ValueError(f"Unknown drift detector: {name}")
 
 
 def load_drift_detector(cfg: Config) -> BaseDriftDetector:
-    """Dynamically load and instantiate a drift detector based on its name.
+    """Build the detector named by ``cfg.drift_detection.detector_name``.
 
-    Args:
-        cfg: Configuration object containing parameters for the detector.
+    Parameters
+    ----------
+    cfg : Config
+        The resolved configuration; only its ``drift_detection`` section is read.
 
-    Returns:
-        BaseDriftDetector: An instance of the specified drift detector.
+    Returns
+    -------
+    BaseDriftDetector
+        The detector, ready for its first :meth:`~BaseDriftDetector.update`.
+
+    Raises
+    ------
+    ValueError
+        If the name is not one this factory knows, or if an ensemble is
+        requested with no members or with itself among them.
     """
-    detector_name = cfg.drift_detection.detector_name
+    dd = cfg.drift_detection
+    name = dd.detector_name
 
-    if detector_name != "EnsembleDetector":
-        return _build_detector(detector_name, cfg)
+    if name != ENSEMBLE_NAME:
+        return _build_simple(name, dd)
 
-    from apeiron.drift_detection.detectors.model_performance_detector import (
-        EnsembleDetector,
-    )
-
-    sub_names = cfg.drift_detection.ensemble_detectors
-    if not sub_names:
+    members = tuple(dd.ensemble_detectors)
+    if not members:
         raise ValueError(
-            "EnsembleDetector requires [drift_detection] ensemble_detectors to list "
-            "at least one sub-detector, e.g. "
-            'ensemble_detectors = ["ADWINDetector", "KSWINDetector"]'
+            f"{ENSEMBLE_NAME} requires `ensemble_detectors` to name at least "
+            f"one sub-detector"
         )
-    if "EnsembleDetector" in sub_names:
-        raise ValueError("EnsembleDetector cannot be nested inside itself")
+    if ENSEMBLE_NAME in members:
+        raise ValueError(f"{ENSEMBLE_NAME} cannot be nested inside itself")
 
     return EnsembleDetector(
-        detectors=[_build_detector(name, cfg) for name in sub_names],
-        voting=cfg.drift_detection.ensemble_voting,
+        [_build_simple(member, dd) for member in members],
+        voting=dd.ensemble_voting,
     )

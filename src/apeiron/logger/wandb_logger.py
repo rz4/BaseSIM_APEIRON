@@ -1,91 +1,154 @@
-"""Weights & Biases logging interface for metrics tracking."""
+"""Weights & Biases metrics backend.
+
+The logger keeps its own global step and a per-stage step, prefixes metric
+keys with the active stage (``eval/acc``), and -- when a ``csv_path`` is
+configured -- keeps every recorded row so the run can be written out as a
+long-format CSV with no service involved.
+
+``WandBLogger(enabled=False)`` is a fully functional null object: it records
+and writes CSVs but never opens a run, which is what ``backend = "none"``
+is built on.
+"""
 
 from __future__ import annotations
 
-import pandas as pd
-import wandb
-from dataclasses import asdict
+import dataclasses
 from pathlib import Path
 from typing import Any, Literal
 
-from apeiron.config.configuration import Config
+try:  # the module-level name is patched by tests and by offline runs
+    import wandb
+except Exception:  # pragma: no cover - wandb is optional
+    wandb = None  # type: ignore[assignment]
 
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover - pandas is optional
+    pd = None  # type: ignore[assignment]
 
+#: The stages a run is divided into.
 StageType = Literal["eval", "drift", "cl"]
-VALID_STAGES: tuple[StageType, ...] = ("eval", "drift", "cl")
+
+#: The only values :meth:`WandBLogger.stage` accepts.
+VALID_STAGES: tuple[str, ...] = ("eval", "drift", "cl")
 
 
 class WandBLogger:
-    """WandB metrics logger with stage-aware step tracking.
+    """Metrics backend writing to Weights & Biases and/or a CSV.
 
-    Tracks global `step` and per-stage steps (eval/step, drift/step, cl/step).
+    Parameters
+    ----------
+    enabled : bool
+        When false no run is opened and nothing is sent; recording and CSV
+        output keep working.
+    csv_path : str | Path | None
+        Where :meth:`to_csv` writes. History is only retained when a path
+        is configured.
     """
 
-    def __init__(self, enabled: bool = True, csv_path: str | Path | None = None):
-        """Initialize WandB logger.
+    def __init__(
+        self,
+        enabled: bool = True,
+        csv_path: str | Path | None = None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.csv_path: Path | None = Path(csv_path) if csv_path is not None else None
+        self.run: Any = None
 
-        Args:
-            enabled: Enable WandB logging
-            csv_path: Save metrics to CSV at this path (disabled if None)
-        """
-        self.enabled = enabled
-        self.csv_path = Path(csv_path) if csv_path else None
-        self.run: wandb.sdk.wandb_run.Run | None = None
+        self._step = 0
+        self._current_stage: str | None = None
+        self._stage_steps: dict[str, int] = {stage: 0 for stage in VALID_STAGES}
         self.metrics_history: list[dict[str, Any]] = []
 
-        # Step tracking
-        self._step = 0
-        self._stage_steps: dict[str, int] = {stage: 0 for stage in VALID_STAGES}
-        self._current_stage: StageType | None = None
-
+    # ------------------------------------------------------------------
+    # properties
+    # ------------------------------------------------------------------
     @property
     def step(self) -> int:
+        """The global step, incremented by every committing :meth:`log`."""
         return self._step
 
     @property
-    def current_stage(self) -> StageType | None:
+    def current_stage(self) -> str | None:
+        """The stage most recently named, or ``None``."""
         return self._current_stage
 
+    @property
+    def url(self) -> str | None:
+        """The run's web URL, or ``None`` when no run is open."""
+        if self.run is None:
+            return None
+        return getattr(self.run, "url", None)
+
+    # ------------------------------------------------------------------
+    # stages
+    # ------------------------------------------------------------------
     def stage(self, name: StageType) -> None:
-        """Set current stage ('eval', 'drift', or 'cl')."""
+        """Select the stage subsequent metrics belong to."""
         if name not in VALID_STAGES:
-            raise ValueError(f"Invalid stage '{name}'. Must be one of: {VALID_STAGES}")
+            raise ValueError(
+                f"Invalid stage {name!r}; expected one of {list(VALID_STAGES)}"
+            )
         self._current_stage = name
 
     def get_stage_step(self, stage: StageType) -> int:
+        """The step counter for ``stage``; ``0`` for one never logged to."""
         return self._stage_steps.get(stage, 0)
 
+    # ------------------------------------------------------------------
+    # run lifecycle
+    # ------------------------------------------------------------------
     def init(
         self,
-        cfg: Config,
-        project: str = "basesim-framework",
+        cfg: Any,
+        project: str | None = None,
         name: str | None = None,
         tags: list[str] | None = None,
         notes: str | None = None,
         group: str | None = None,
-        **kwargs,
-    ) -> wandb.sdk.wandb_run.Run | None:
-        """Initialize wandb run with config."""
-        if not self.enabled:
+        **kwargs: Any,
+    ) -> Any:
+        """Open a run, unless disabled.
+
+        The frozen config dataclass is passed through as a plain nested
+        dict, and ``step`` is declared as the x-axis for every metric.
+        """
+        if not self.enabled or wandb is None:
             return None
 
         self.run = wandb.init(
             project=project,
             name=name,
-            config=asdict(cfg),
             tags=tags,
             notes=notes,
             group=group,
+            config=_as_dict(cfg),
             settings=wandb.Settings(silent=True),
             **kwargs,
         )
-
-        if self.run:
+        # wandb.init can return None; define_metric must not be called on it
+        if self.run is not None:
             self.run.define_metric("step")
             self.run.define_metric("*", step_metric="step")
-
         return self.run
 
+    def finish(self, exit_code: int | None = None, save_csv: bool = True) -> Path | None:
+        """Close the run, optionally writing the CSV first.
+
+        Returns
+        -------
+        Path | None
+            The CSV that was written, if any.
+        """
+        written = self.to_csv() if save_csv else None
+        if self.enabled and self.run is not None and wandb is not None:
+            wandb.finish(exit_code=exit_code)
+        self.run = None
+        return written
+
+    # ------------------------------------------------------------------
+    # logging
+    # ------------------------------------------------------------------
     def log(
         self,
         metrics: dict[str, Any],
@@ -94,23 +157,20 @@ class WandBLogger:
         prefix: bool = True,
         increment: bool = True,
     ) -> None:
-        """Log metrics with auto-prefixing by current stage.
+        """Record one row of metrics.
 
-        Args:
-            metrics: Metric name/value pairs
-            step: Override global step (None = use internal counter)
-            commit: Commit immediately to wandb
-            prefix: Auto-prefix metrics with current stage (skips keys with "/")
-            increment: Increment step counters
+        The row carries two columns of the logger's own: the global ``step``
+        and, when a stage is active, ``{stage}/step``.
         """
         if increment:
             self._step += 1
             if self._current_stage:
-                self._stage_steps[self._current_stage] += 1
+                self._stage_steps[self._current_stage] = (
+                    self._stage_steps.get(self._current_stage, 0) + 1
+                )
 
-        current_step = step if step is not None else self._step
+        current_step = self._step if step is None else step
 
-        # Build prefixed metrics
         prefixed_metrics: dict[str, Any] = {}
         for key, value in metrics.items():
             if prefix and self._current_stage and "/" not in key:
@@ -118,75 +178,70 @@ class WandBLogger:
             else:
                 prefixed_metrics[key] = value
 
-        # Add step metrics
         prefixed_metrics["step"] = current_step
         if self._current_stage:
-            prefixed_metrics[f"{self._current_stage}/step"] = self._stage_steps[
-                self._current_stage
-            ]
+            prefixed_metrics[f"{self._current_stage}/step"] = self._stage_steps.get(
+                self._current_stage, 0
+            )
 
-        # Save to history if CSV path provided
-        if self.csv_path:
-            self.metrics_history.append(prefixed_metrics.copy())
-
-        # Log to wandb
-        if self.enabled and self.run:
+        if self.enabled and self.run is not None and wandb is not None:
             wandb.log(prefixed_metrics, commit=commit)
+
+        if self.csv_path is not None:
+            self.metrics_history.append(prefixed_metrics)
 
     def save(
         self,
-        file_path: str | Path,
+        path: str | Path,
         base_path: str | Path | None = None,
-        policy: Literal["now", "live", "end"] = "now",
+        policy: str = "now",
     ) -> None:
-        """Save file to wandb."""
-        if self.enabled and self.run:
+        """Upload a file as a run artifact; a no-op without a run."""
+        if self.enabled and self.run is not None and wandb is not None:
             wandb.save(
-                str(file_path),
-                base_path=str(base_path) if base_path else None,
+                str(path),
+                base_path=str(base_path) if base_path is not None else None,
                 policy=policy,
             )
 
-    def to_dataframe(self) -> pd.DataFrame | None:
-        """Convert metrics to long-format DataFrame (step, metric, value)."""
-        if not self.metrics_history:
+    # ------------------------------------------------------------------
+    # records
+    # ------------------------------------------------------------------
+    def to_dataframe(self) -> Any:
+        """The recorded history in long format.
+
+        Columns are ``step``, ``metric``, ``value`` -- one row per recorded
+        value, with ``step`` lifted out of each entry rather than repeated
+        as a metric of its own.
+        """
+        if not self.metrics_history or pd is None:
             return None
-
-        rows = []
-        for entry in self.metrics_history:
-            step = entry.get("step")
-            for metric_name, value in entry.items():
-                if metric_name != "step":
-                    rows.append({"step": step, "metric": metric_name, "value": value})
-
-        return pd.DataFrame(rows)
+        rows = [
+            {"step": entry.get("step"), "metric": key, "value": value}
+            for entry in self.metrics_history
+            for key, value in entry.items()
+            if key != "step"
+        ]
+        if not rows:
+            return None
+        return pd.DataFrame(rows, columns=["step", "metric", "value"])
 
     def to_csv(self, csv_path: str | Path | None = None) -> Path | None:
-        """Save metrics to CSV in long format (step, metric, value)."""
-        df = self.to_dataframe()
-        if df is None:
+        """Write the history to ``csv_path`` or the configured path."""
+        target = csv_path if csv_path is not None else self.csv_path
+        if target is None:
             return None
-
-        output_path = Path(csv_path) if csv_path else self.csv_path
-        if output_path is None:
+        frame = self.to_dataframe()
+        if frame is None:
             return None
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(target, index=False)
+        return target
 
-        output_path.parent.mkdir(exist_ok=True, parents=True)
-        df.to_csv(output_path, index=False)
-        return output_path
 
-    def finish(
-        self, exit_code: int | None = None, save_csv: bool = True
-    ) -> Path | None:
-        """Finish wandb run and optionally save CSV."""
-        csv_path = self.to_csv() if save_csv and self.csv_path else None
-
-        if self.enabled and self.run:
-            wandb.finish(exit_code=exit_code)
-            self.run = None
-
-        return csv_path
-
-    @property
-    def url(self) -> str | None:
-        return self.run.url if self.run else None
+def _as_dict(cfg: Any) -> Any:
+    """A config dataclass as a plain nested dict; anything else unchanged."""
+    if dataclasses.is_dataclass(cfg) and not isinstance(cfg, type):
+        return dataclasses.asdict(cfg)
+    return cfg

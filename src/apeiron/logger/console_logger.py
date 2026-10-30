@@ -1,4 +1,11 @@
-"""Console logging interface with verbosity control."""
+"""Console logging: a tiered, coloured stdout logger.
+
+The verbosity string accepted here is the one a TOML config carries, so the
+parsing is deliberately forgiving: names are upper-cased and stripped, an
+``INFO:n`` tier subtracts ``n`` from ``logging.INFO`` (and only from INFO),
+and a name the level map does not hold falls back to ``INFO`` rather than
+raising -- a config typo must not take a training run down.
+"""
 
 from __future__ import annotations
 
@@ -6,160 +13,208 @@ import logging
 import sys
 from typing import Callable
 
+#: The level names a verbosity string may use.
+LEVEL_MAP: dict[str, int] = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
 
-# Constants
-MAX_INFO_TIER = 9  # Support INFO:0 through INFO:9
-LOG_FORMAT = "%(levelname)s | %(asctime)s | step=%(step)s | %(module)s | %(message)s"
-TIME_FORMAT = "%H:%M:%S"
+#: Default format used by the stream handler.
+DEFAULT_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
+
+#: Default ``asctime`` format.
+DEFAULT_DATE_FORMAT = "%H:%M:%S"
+
+#: The logger name the console handler is attached to.
+LOGGER_NAME = "apeiron"
 
 
-# ANSI color codes
-class Colors:
-    """ANSI color codes for terminal output."""
+class ColoredFormatter(logging.Formatter):
+    """A ``logging.Formatter`` that wraps the level name in ANSI colour.
+
+    The record is restored after formatting so a second handler sees it
+    untouched.
+    """
+
+    COLORS: dict[str, str] = {
+        "DEBUG": "\033[36m",  # cyan
+        "INFO": "\033[32m",  # green
+        "WARNING": "\033[33m",  # yellow
+        "ERROR": "\033[31m",  # red
+        "CRITICAL": "\033[1;31m",  # bold red
+    }
 
     RESET = "\033[0m"
-    RED = "\033[31m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    GREEN = "\033[32m"
-    WHITE = "\033[37m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        original = record.levelname
+        color = self.COLORS.get(original)
+        if color is not None:
+            record.levelname = f"{color}{original}{self.RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original
 
 
 class StepFilter(logging.Filter):
-    """Filter that adds step information to log records."""
+    """Attaches the current training step to every record.
 
-    def __init__(self, get_step: Callable[[], int]):
+    Parameters
+    ----------
+    get_step : Callable[[], int] | None
+        Returns the step to stamp onto a record. A missing or failing
+        callable yields ``0`` rather than losing the record.
+    """
+
+    def __init__(self, get_step: Callable[[], int] | None = None) -> None:
         super().__init__()
         self.get_step = get_step
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.step = self.get_step()
+        step = 0
+        if self.get_step is not None:
+            try:
+                step = self.get_step()
+            except Exception:  # pragma: no cover - never drop a record
+                step = 0
+        record.step = step
         return True
 
 
-class ColoredFormatter(logging.Formatter):
-    """Formatter that adds colors to log levels."""
-
-    LEVEL_COLORS = {
-        "CRITICAL": Colors.RED,
-        "ERROR": Colors.RED,
-        "WARNING": Colors.YELLOW,
-        "DEBUG": Colors.WHITE,
-    }
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Add INFO:n colors dynamically
-        self.LEVEL_COLORS["INFO:0"] = Colors.GREEN
-        for n in range(1, MAX_INFO_TIER + 1):
-            self.LEVEL_COLORS[f"INFO:{n}"] = Colors.BLUE
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Format log record with colored level name."""
-        color = self.LEVEL_COLORS.get(record.levelname, "")
-
-        # Create a copy with colored level name
-        record_copy = logging.makeLogRecord(record.__dict__)
-        if color:
-            record_copy.levelname = f"{color}{record.levelname}{Colors.RESET}"
-
-        return super().format(record_copy)
-
-
 class ConsoleLogger:
-    """Console logging with tiered INFO verbosity (INFO:0 to INFO:9)."""
+    """Stdout logging with a tiered ``INFO`` level.
 
-    LEVEL_MAP = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-        "CRITICAL": logging.CRITICAL,
-    }
-
-    def _parse_verbosity(self, level_str: str) -> tuple[str, int]:
-        """Parse 'INFO:2' → ('INFO', 2) or 'DEBUG' → ('DEBUG', 0)."""
-        level_str = level_str.upper().strip()
-
-        if ":" in level_str:
-            base_level, tier_str = level_str.split(":", 1)
-            try:
-                tier = max(0, int(tier_str))
-            except ValueError:
-                tier = 0
-            return (base_level, tier)
-
-        return (level_str, 0)
-
-    def _get_log_level(self, level_str: str) -> int:
-        """Calculate numeric level: INFO:n → 20-n, DEBUG → 10, etc."""
-        base_level, tier = self._parse_verbosity(level_str)
-        return (
-            20 - tier
-            if base_level == "INFO"
-            else self.LEVEL_MAP.get(base_level, logging.INFO)
-        )
+    Parameters
+    ----------
+    verbosity : str
+        Either a level name (``"INFO"``, ``"debug"``, ...) or a tiered
+        ``"INFO:n"`` string. Stored upper-cased.
+    name : str
+        The underlying ``logging.Logger`` name.
+    get_step : Callable[[], int] | None
+        Optional step source, attached through a :class:`StepFilter`.
+    colored : bool
+        Whether to use :class:`ColoredFormatter`.
+    """
 
     def __init__(
-        self, verbosity: str = "INFO", get_step: Callable[[], int] | None = None
-    ):
-        """Initialize console logger with tiered INFO verbosity support.
+        self,
+        verbosity: str = "INFO",
+        name: str = LOGGER_NAME,
+        get_step: Callable[[], int] | None = None,
+        colored: bool = True,
+    ) -> None:
+        self._verbosity = str(verbosity).upper()
+        self._name = name
+        self._get_step = get_step
+        self._colored = colored
 
-        Args:
-            verbosity: Console level (DEBUG, INFO, INFO:n, WARNING, ERROR, CRITICAL)
-            get_step: Callback to get current step for display (defaults to returning 0)
-        """
-        self._verbosity = verbosity.upper()
-        self._get_step = get_step or (lambda: 0)
-
-        # Register custom INFO:n levels (INFO:0=20, INFO:1=19, ..., INFO:9=11)
-        for n in range(MAX_INFO_TIER + 1):
-            logging.addLevelName(20 - n, f"INFO:{n}")
-
-        # Configure logger
-        self._logger = logging.getLogger(__name__)
-        log_level = self._get_log_level(self._verbosity)
-        self._logger.setLevel(log_level)
-
-        if not self._logger.handlers:
-            handler = logging.StreamHandler(sys.stdout)
-            handler.setLevel(log_level)
-            handler.setFormatter(ColoredFormatter(LOG_FORMAT, datefmt=TIME_FORMAT))
-            handler.addFilter(StepFilter(self._get_step))
-            self._logger.addHandler(handler)
-
+        self._logger = logging.getLogger(name)
         self._logger.propagate = False
+        self._handler = logging.StreamHandler(stream=sys.stdout)
+        formatter_cls = ColoredFormatter if colored else logging.Formatter
+        self._handler.setFormatter(
+            formatter_cls(DEFAULT_FORMAT, datefmt=DEFAULT_DATE_FORMAT)
+        )
+        self._filter = StepFilter(get_step=get_step)
+        self._handler.addFilter(self._filter)
 
+        # A fresh ConsoleLogger owns the handler set: repeated construction
+        # (entry points, tests) must not duplicate every line.
+        for existing in list(self._logger.handlers):
+            self._logger.removeHandler(existing)
+        self._logger.addHandler(self._handler)
+
+        self._logger.setLevel(self._get_log_level(self._verbosity))
+
+    # ------------------------------------------------------------------
+    # verbosity parsing
+    # ------------------------------------------------------------------
+    def _parse_verbosity(self, verbosity: str) -> tuple[str, int]:
+        """Split a verbosity string into ``(base_level, tier)``.
+
+        ``"INFO:3"`` -> ``("INFO", 3)``; a tier that is absent, negative or
+        not a number is ``0``.
+        """
+        raw = str(verbosity).strip().upper()
+        base, sep, tier_text = raw.partition(":")
+        tier = 0
+        if sep:
+            try:
+                tier = int(tier_text)
+            except ValueError:
+                tier = 0
+        if tier < 0:
+            tier = 0
+        return base, tier
+
+    def _get_log_level(self, verbosity: str) -> int:
+        """Resolve a verbosity string to a numeric level.
+
+        The tier offset applies to ``INFO`` only; an unrecognised name maps
+        to ``INFO`` instead of raising.
+        """
+        base_level, tier = self._parse_verbosity(verbosity)
+        return (
+            logging.INFO - tier
+            if base_level == "INFO"
+            else LEVEL_MAP.get(base_level, logging.INFO)
+        )
+
+    # ------------------------------------------------------------------
+    # properties
+    # ------------------------------------------------------------------
     @property
     def verbosity(self) -> str:
+        """The verbosity string as stored (upper-cased, not stripped)."""
         return self._verbosity
 
     @verbosity.setter
-    def verbosity(self, level: str) -> None:
-        self._verbosity = level.upper()
-        log_level = self._get_log_level(self._verbosity)
-        self._logger.setLevel(log_level)
-        for handler in self._logger.handlers:
-            handler.setLevel(log_level)
+    def verbosity(self, value: str) -> None:
+        self._verbosity = str(value).upper()
+        self._logger.setLevel(self._get_log_level(self._verbosity))
 
-    def debug(self, msg: str, *args, **kwargs) -> None:
-        self._logger.debug(msg, *args, stacklevel=3, **kwargs)
+    @property
+    def logger(self) -> logging.Logger:
+        """The underlying ``logging.Logger``."""
+        return self._logger
 
-    def info(self, msg: str, level: int = 0, *args, **kwargs) -> None:
-        """Log at INFO:level tier (0=standard, 1+=more verbose)."""
-        if level >= 10:
-            self._logger.debug(msg, *args, stacklevel=3, **kwargs)
+    @property
+    def level(self) -> int:
+        """The numeric level currently in effect."""
+        return self._logger.level
+
+    # ------------------------------------------------------------------
+    # emit
+    # ------------------------------------------------------------------
+    def info(self, msg: str, level: int = 0) -> None:
+        """Log at ``INFO`` minus ``level``.
+
+        A tier deep enough to reach ``DEBUG`` is emitted as ``DEBUG`` so it
+        stays inside the documented level range.
+        """
+        resolved = logging.INFO - int(level)
+        if resolved <= logging.DEBUG:
+            self._logger.debug(msg)
         else:
-            self._logger.log(20 - level, msg, *args, stacklevel=3, **kwargs)
+            self._logger.log(resolved, msg)
 
-    def warning(self, msg: str, *args, **kwargs) -> None:
-        self._logger.warning(msg, *args, stacklevel=3, **kwargs)
+    def debug(self, msg: str) -> None:
+        self._logger.debug(msg)
 
-    def error(self, msg: str, *args, **kwargs) -> None:
-        self._logger.error(msg, *args, stacklevel=3, **kwargs)
+    def warning(self, msg: str) -> None:
+        self._logger.warning(msg)
 
-    def critical(self, msg: str, *args, **kwargs) -> None:
-        self._logger.critical(msg, *args, stacklevel=3, **kwargs)
+    def error(self, msg: str) -> None:
+        self._logger.error(msg)
 
-    def exception(self, msg: str, *args, **kwargs) -> None:
-        self._logger.exception(msg, *args, stacklevel=3, **kwargs)
+    def critical(self, msg: str) -> None:
+        self._logger.critical(msg)
+
+    def exception(self, msg: str) -> None:
+        """Log ``msg`` at ``ERROR`` with the active traceback attached."""
+        self._logger.exception(msg)
