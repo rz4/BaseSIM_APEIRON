@@ -83,38 +83,21 @@ class TestAccuracy:
 
 
 class TestEmptyLoader:
-    @pytest.mark.xfail(
-        reason="A19: returns a bare 0.0 instead of a (accuracy, loss) pair, "
-        "so every caller unpacking the result raises TypeError",
-        strict=True,
-    )
-    def test_empty_loader_returns_a_pair(self):
+    def test_empty_loader_refuses(self):
+        """Nothing was scored, so nothing is reported. The old bare 0.0 was
+        unpackable by every caller expecting a pair, and indistinguishable
+        from a perfect loss (A19)."""
         empty = TensorDataset(torch.empty(0, 4), torch.empty(0, dtype=torch.long))
-        accuracy, loss = evaluate(
-            _model(), DataLoader(empty, batch_size=4), nn.CrossEntropyLoss(), _Cfg()
-        )
-        assert (accuracy, loss) == (0.0, 0.0)
-
-    def test_empty_loader_currently_returns_a_scalar(self):
-        # the present behavior, recorded so the xfail above has a counterpart
-        empty = TensorDataset(torch.empty(0, 4), torch.empty(0, dtype=torch.long))
-        assert (
+        with pytest.raises(ValueError, match="(?i)empty"):
             evaluate(
                 _model(), DataLoader(empty, batch_size=4), nn.CrossEntropyLoss(), _Cfg()
             )
-            == 0.0
-        )
 
 
 class TestLoss:
-    @pytest.mark.xfail(
-        reason="A19: batch losses from a mean-reduction criterion are summed and "
-        "then divided by the SAMPLE count, under-reporting by samples/batches "
-        "(6x for 12 samples in 2 batches). The code comment claims a sum "
-        "reduction it never requests, and no harness supplies one.",
-        strict=True,
-    )
     def test_loss_is_the_mean_over_samples(self):
+        """Fixed from A19: batch means are weighted by batch size, so the
+        reported loss no longer scales with the loader's batching."""
         data, model = _data(), _model()
         criterion = nn.CrossEntropyLoss()  # what every harness returns
         _, reported = evaluate(model, DataLoader(data, batch_size=8), criterion, _Cfg())
@@ -137,10 +120,25 @@ class TestLoss:
             ).item()
         assert reported == pytest.approx(expected, rel=1e-5)
 
-    def test_reported_loss_scales_with_the_batch_count(self):
-        # the defect's signature: a quantity that should be batch-size
-        # invariant moves by the number of batches
+    def test_reported_loss_is_batch_size_invariant(self):
+        # A19's signature inverted: the defect made this quantity move by
+        # the number of batches; it must not move at all
         data, model, crit = _data(n=12), _model(), nn.CrossEntropyLoss()
         one_batch = evaluate(model, DataLoader(data, batch_size=12), crit, _Cfg())[1]
         six_batches = evaluate(model, DataLoader(data, batch_size=2), crit, _Cfg())[1]
-        assert six_batches == pytest.approx(6 * one_batch, rel=1e-5)
+        assert six_batches == pytest.approx(one_batch, rel=1e-5)
+
+    def test_a_sum_reduction_criterion_reports_the_same_mean(self):
+        # the docstring's old promise, now actually honored: both
+        # reductions land on the same per-sample mean
+        data, model = _data(n=12), _model()
+        mean_loss = evaluate(
+            model, DataLoader(data, batch_size=4), nn.CrossEntropyLoss(), _Cfg()
+        )[1]
+        sum_loss = evaluate(
+            model,
+            DataLoader(data, batch_size=4),
+            nn.CrossEntropyLoss(reduction="sum"),
+            _Cfg(),
+        )[1]
+        assert sum_loss == pytest.approx(mean_loss, rel=1e-5)
