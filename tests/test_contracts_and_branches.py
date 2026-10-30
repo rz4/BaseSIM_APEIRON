@@ -171,17 +171,17 @@ class TestMonitorBranches:
         harness = make_harness(cfg)
         return ContinuousMonitor(cfg=cfg, modelHarness=harness), harness, cfg
 
-    def test_unknown_aggregation_falls_back_to_the_mean(
+    def test_unknown_aggregation_is_refused_at_the_check(
         self, make_harness, default_cfg
     ):
-        # worth knowing: a misspelled aggregation is not refused, it becomes
-        # the mean (LOG A20)
+        # A20, seen from the check loop: the refusal surfaces where the
+        # aggregation is first used, naming the bad value
         monitor, _, _ = self._monitor(
             make_harness, default_cfg, aggregation="geometric-mean"
         )
         monitor.metric_buffer = [[1.0], [2.0], [6.0]]
-        signal = monitor._check_drift()
-        assert signal is not None
+        with pytest.raises(ValueError, match="aggregation"):
+            monitor._check_drift()
         assert monitor.metric_buffer == []
 
     def _aggregate(self, monitor, buffer):
@@ -209,11 +209,16 @@ class TestMonitorBranches:
         value = self._aggregate(monitor, [[1.0], [2.0], [6.0]])
         assert value == pytest.approx(expected)
 
-    def test_the_fallback_aggregates_as_the_mean(self, make_harness, default_cfg):
+    def test_an_unknown_aggregation_refuses_and_names_the_options(
+        self, make_harness, default_cfg
+    ):
+        """A20: the old silent fall-through to the mean meant a misspelled
+        `aggregation` monitored a different quantity than the one asked for."""
         monitor, _, _ = self._monitor(
             make_harness, default_cfg, aggregation="geometric-mean"
         )
-        assert self._aggregate(monitor, [[1.0], [2.0], [6.0]]) == pytest.approx(3.0)
+        with pytest.raises(ValueError, match="geometric-mean"):
+            self._aggregate(monitor, [[1.0], [2.0], [6.0]])
 
     def test_empty_buffer_refuses(self, make_harness, default_cfg):
         monitor, _, _ = self._monitor(make_harness, default_cfg)

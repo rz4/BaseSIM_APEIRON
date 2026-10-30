@@ -155,15 +155,26 @@ class ConsoleLogger:
     def _get_log_level(self, verbosity: str) -> int:
         """Resolve a verbosity string to a numeric level.
 
-        The tier offset applies to ``INFO`` only; an unrecognised name maps
-        to ``INFO`` instead of raising.
+        The tier offset applies to ``INFO`` only. An unrecognised name maps
+        to ``INFO`` rather than raising -- a logging setting should not kill
+        a run -- but it WARNS: the old silent fallback meant
+        ``verbosity = "WARN"`` printed the full info stream, more output
+        than asked for, on exactly the runs trying to be quiet
+        (claims/LOG.md A52).
         """
         base_level, tier = self._parse_verbosity(verbosity)
-        return (
-            logging.INFO - tier
-            if base_level == "INFO"
-            else LEVEL_MAP.get(base_level, logging.INFO)
-        )
+        if base_level == "INFO":
+            return logging.INFO - tier
+        if base_level not in LEVEL_MAP:
+            import warnings
+
+            warnings.warn(
+                f"unrecognised verbosity {verbosity!r}; falling back to INFO. "
+                f"Known names: DEBUG, INFO, INFO:0-9, WARNING, ERROR, "
+                f"CRITICAL (did you mean WARNING rather than WARN?)",
+                stacklevel=3,
+            )
+        return LEVEL_MAP.get(base_level, logging.INFO)
 
     # ------------------------------------------------------------------
     # properties

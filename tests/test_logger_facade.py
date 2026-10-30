@@ -166,3 +166,32 @@ class TestConfigureBackend:
         )
         assert configure_backend(cfg) == "mlflow"
         assert mlflow.get_tracking_uri() == uri
+
+
+class TestUnknownVerbosityWarns:
+    """A52: `verbosity = "WARN"` used to print MORE than asked, silently --
+    the fallback to INFO is kept (a logging setting should not kill a run)
+    but it now announces itself."""
+
+    def test_warn_is_not_warning_and_says_so(self):
+        import warnings
+
+        from apeiron.logger.console_logger import ConsoleLogger
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ConsoleLogger(verbosity="WARN")
+        assert any("WARN" in str(w.message) for w in caught), (
+            "an unrecognised verbosity fell back to INFO without a word"
+        )
+
+    def test_known_names_stay_silent(self):
+        import warnings
+
+        from apeiron.logger.console_logger import ConsoleLogger
+
+        for name in ("DEBUG", "INFO", "INFO:2", "WARNING", "ERROR", "CRITICAL"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                ConsoleLogger(verbosity=name)
+            assert not caught, f"{name} is a known verbosity and warned anyway"

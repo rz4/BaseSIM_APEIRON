@@ -194,11 +194,15 @@ class ContinuousMonitor:
     def _aggregate_buffer(self) -> float:
         """Reduce the buffered metric column to the number the detector sees.
 
-        Recognises ``"mean"``, ``"median"`` and ``"last"``; anything else is
-        the mean. The buffer is emptied, so the next window starts clean.
+        Recognises ``"mean"``, ``"median"`` and ``"last"``. Anything else
+        refuses: this value decides what every drift verdict is computed
+        from, and the old silent fall-through to the mean meant a misspelled
+        ``aggregation`` configured a different detector than the one asked
+        for, with nothing anywhere saying so (claims/LOG.md A20).
 
         :raises RuntimeError: If no batch has been evaluated since the last
             check.
+        :raises ValueError: If ``aggregation`` names no known reduction.
         """
         if not self.metric_buffer:
             raise RuntimeError(
@@ -213,8 +217,15 @@ class ContinuousMonitor:
             agg_metric = values[-1]
         elif self.aggregation == "median":
             agg_metric = float(np.median(values))
-        else:
+        elif self.aggregation == "mean":
             agg_metric = float(np.mean(values))
+        else:
+            raise ValueError(
+                f"unknown drift_detection.aggregation {self.aggregation!r}: "
+                f"expected 'mean', 'median' or 'last'. (This used to fall "
+                f"back to the mean silently, so a typo changed what the "
+                f"detector monitored.)"
+            )
 
         self.last_agg_metric = agg_metric
         return agg_metric
