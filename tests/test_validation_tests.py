@@ -15,8 +15,7 @@ import torch
 from apeiron.config.configuration import build_config
 from apeiron.drift_detection.detectors.base import DriftSignal, LearningRegime
 from apeiron.driver.continuous_monitor import ContinuousMonitor
-from apeiron.logger import get_logger
-import apeiron.logger.logger as logger_module
+from apeiron.logger import get_logger, reset_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -92,7 +91,7 @@ def _run_mnist_until_first_drift(output_csv: Path) -> None:
     )
     _set_deterministic_seed(cfg.seed)
 
-    logger_module._default_logger = None
+    reset_logger()
     logger = get_logger(verbosity="WARNING", backend="none", csv_path=output_csv)
     logger.init(cfg, project="mnist-validation")
 
@@ -122,7 +121,7 @@ def _run_mnist_until_first_drift(output_csv: Path) -> None:
                     break
 
     logger.finish()
-    logger_module._default_logger = None
+    reset_logger()
 
 
 @pytest.mark.slow

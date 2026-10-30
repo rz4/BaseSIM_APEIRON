@@ -165,3 +165,19 @@ def dummy_harness_with_history(default_cfg: Config) -> DummyHarness:
         hist_train_data=TensorDataset(torch.randn(n, in_f), torch.randint(0, nc, (n,))),
         hist_val_data=TensorDataset(torch.randn(n, in_f), torch.randint(0, nc, (n,))),
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_logger():
+    """Drop the logger singleton around every test.
+
+    Several tests replace methods on the instance `get_logger()` returns;
+    without this, a crippled singleton leaks into whichever test runs next
+    and fails it somewhere far from the cause -- found when the first-drift
+    reference test stopped writing its CSV only under full-suite ordering.
+    """
+    from apeiron.logger import reset_logger
+
+    reset_logger()
+    yield
+    reset_logger()
