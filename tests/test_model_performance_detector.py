@@ -349,7 +349,8 @@ class TestModelEvalDetector:
         assert signal.regime == LearningRegime.STABLE
 
     def test_mismatched_metric_counts_refuse(self):
-        with pytest.raises(AssertionError):
+        # ValueError, not AssertionError: an assert vanishes under -O (A21)
+        with pytest.raises(ValueError):
             ModelEvalDetector().update(
                 0.0,
                 modelHarness=_StubHarness([1.0, 2.0]),

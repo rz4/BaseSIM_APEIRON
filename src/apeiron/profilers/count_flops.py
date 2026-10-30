@@ -72,19 +72,16 @@ class FLOPSProfiler:
         self.tag = tag
         self.start_time = time.perf_counter()
         counter = FlopCounterMode(display=False)
-        flop = 0
         try:
-            try:
-                with counter:
-                    yield
-                flop = int(counter.get_total_flops())
-            finally:
-                elapsed = time.perf_counter() - (
-                    self.start_time
-                    if self.start_time is not None
-                    else time.perf_counter()
-                )
-                self._record(tag, flop, elapsed)
+            with counter:
+                yield
+            # Recorded only on a clean exit: a block that RAISED used to be
+            # appended as a zero-FLOP measurement, indistinguishable from a
+            # block that genuinely did no work, pulling every average over
+            # the tag toward zero with no trace of the failure
+            # (claims/LOG.md A50). The exception itself is the record now.
+            elapsed = time.perf_counter() - self.start_time
+            self._record(tag, int(counter.get_total_flops()), elapsed)
         finally:
             self.tag = None
             self.start_time = None

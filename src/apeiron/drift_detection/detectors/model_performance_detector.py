@@ -235,14 +235,19 @@ class ModelEvalDetector(BaseDriftDetector):
         current = list(harness.eval())
         reference = list(reference)
         directions = list(higher_is_better.values())
-        assert len(current) == len(reference), (
-            f"{type(self).__name__} got {len(current)} current metrics and "
-            f"{len(reference)} reference metrics"
-        )
-        assert len(current) == len(directions), (
-            f"{type(self).__name__} got {len(current)} metrics and "
-            f"{len(directions)} entries in `higher_is_better`"
-        )
+        # ValueError, not assert: a mismatched metric count is a caller's
+        # configuration error, and an assert vanishes under `python -O`,
+        # leaving the zip below to silently truncate (claims/LOG.md A21).
+        if len(current) != len(reference):
+            raise ValueError(
+                f"{type(self).__name__} got {len(current)} current metrics and "
+                f"{len(reference)} reference metrics"
+            )
+        if len(current) != len(directions):
+            raise ValueError(
+                f"{type(self).__name__} got {len(current)} metrics and "
+                f"{len(directions)} entries in `higher_is_better`"
+            )
 
         regressed = [
             i
