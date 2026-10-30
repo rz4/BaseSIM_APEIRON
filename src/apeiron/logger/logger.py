@@ -16,7 +16,7 @@ backend object".
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from apeiron.logger.console_logger import ConsoleLogger
 from apeiron.logger.mlflow_logger import MLFlowLogger
@@ -175,7 +175,7 @@ class Logger:
         self._console.exception(msg)
 
 
-def configure_backend(cfg: Any) -> str:
+def configure_backend(cfg: Any) -> MetricsBackend:
     """Resolve the metrics backend a config asks for.
 
     A config with no ``[logging]`` section -- and ``None`` itself -- means
@@ -209,7 +209,7 @@ def configure_backend(cfg: Any) -> str:
 
             mlflow.set_tracking_uri(tracking_uri)
 
-    return backend
+    return cast(MetricsBackend, backend)
 
 
 def get_logger(

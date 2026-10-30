@@ -196,7 +196,7 @@ class WandBLogger:
         self,
         path: str | Path,
         base_path: str | Path | None = None,
-        policy: str = "now",
+        policy: Literal["now", "live", "end"] = "now",
     ) -> None:
         """Upload a file as a run artifact; a no-op without a run."""
         if self.enabled and self.run is not None and wandb is not None:

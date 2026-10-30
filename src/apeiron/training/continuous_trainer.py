@@ -146,7 +146,7 @@ class ContinuousTrainer:
         labels in the same order, so the two are zipped.  An absent domain
         contributes nothing rather than a column of ``None``.
         """
-        logger = get_logger(__name__)
+        logger = get_logger()
         names = list(self.modelHarness.eval_metrics.keys())
 
         payload: dict[str, Any] = {"drift_event_id": drift_event_id}
@@ -195,7 +195,7 @@ class ContinuousTrainer:
             this round, carried on every row the round logs.
         :type drift_event_id: int
         """
-        logger = get_logger(__name__)
+        logger = get_logger()
 
         cur_train_loader, _cur_val_loader = self.modelHarness.get_train_dataloaders()
         hist_loaders = self.modelHarness.get_hist_dataloaders()
@@ -298,9 +298,8 @@ class ContinuousTrainer:
         """
         batch_size = int(self.cfg.train.batch_size)
         accumulation_steps = max(1, int(self.cfg.train.grad_accumulation_steps))
-        measuring = (
-            self.profiler is not None and iter_count > self.profiler.warmup_iters
-        )
+        profiler = self.profiler
+        measuring = profiler is not None and iter_count > profiler.warmup_iters
 
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -320,16 +319,16 @@ class ContinuousTrainer:
                     hist_iter, hist_train_loader, min_batch=batch_size
                 )
 
-            if measuring and step == 0:
-                with self.profiler.measure_flops(tag="update_fwd_bwd"):
+            if measuring and profiler is not None and step == 0:
+                with profiler.measure_flops(tag="update_fwd_bwd"):
                     gen_loss += float(self.cl_updater.fwd_bwd(cur_batch, hist_batch))
             else:
                 gen_loss += float(self.cl_updater.fwd_bwd(cur_batch, hist_batch))
 
         reg_loss = float(self.cl_updater.update_post_fwd_bwd())
 
-        if measuring:
-            with self.profiler.measure_flops_optimizer(
+        if measuring and profiler is not None:
+            with profiler.measure_flops_optimizer(
                 self.model, self.cfg.device, tag="optimizer"
             ):
                 self.optimizer.step()

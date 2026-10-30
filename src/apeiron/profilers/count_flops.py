@@ -156,7 +156,9 @@ class FLOPSProfiler:
         for event in prof.key_averages():
             key = getattr(event, "key", None)
             count = int(getattr(event, "count", 0) or 0)
-            per_element = ATEN_FLOPS_PER_ELEMENT.get(key)
+            per_element = (
+                ATEN_FLOPS_PER_ELEMENT.get(key) if isinstance(key, str) else None
+            )
             contribution = 0
             if per_element is not None:
                 contribution = int(per_element) * count

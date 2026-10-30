@@ -85,27 +85,46 @@ class OnlineKFACUpdater(BaseUpdater):
         return isinstance(module, (nn.Linear, nn.Conv2d))
 
     @staticmethod
+    def _weight(module: nn.Module) -> torch.Tensor:
+        """The layer's weight as the Parameter both supported types carry.
+
+        ``nn.Module.__getattr__`` types attribute access as
+        ``Tensor | Module``; the registry only ever holds Linear and Conv2d,
+        whose ``weight`` is a Parameter.
+        """
+        weight = module.weight
+        assert isinstance(weight, torch.Tensor)
+        return weight
+
+    @staticmethod
     def _a_dim(module: nn.Module) -> int:
         if isinstance(module, nn.Conv2d):
             kh, kw = module.kernel_size
-            return module.in_channels * kh * kw
-        return module.in_features
+            return int(module.in_channels * kh * kw)
+        assert isinstance(module, nn.Linear)
+        return int(module.in_features)
 
     @staticmethod
     def _g_dim(module: nn.Module) -> int:
         if isinstance(module, nn.Conv2d):
-            return module.out_channels
-        return module.out_features
+            return int(module.out_channels)
+        assert isinstance(module, nn.Linear)
+        return int(module.out_features)
 
     @staticmethod
     def _extract_a(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
         """The layer's inputs as a ``(rows, a_dim)`` matrix."""
         if isinstance(module, nn.Conv2d):
+            padding = module.padding
+            assert not isinstance(padding, str), (
+                "string padding ('same'/'valid') is not supported by the "
+                "K-FAC unfolding; use explicit numeric padding"
+            )
             patches = F.unfold(
                 a,
                 kernel_size=module.kernel_size,
                 dilation=module.dilation,
-                padding=module.padding,
+                padding=padding,
                 stride=module.stride,
             )
             return patches.transpose(1, 2).reshape(-1, patches.shape[1])
@@ -151,19 +170,20 @@ class OnlineKFACUpdater(BaseUpdater):
 
         A step taken without a preceding ``cl_preprocessing`` commits nothing.
         """
-        if self._A_accum is not None and self._cl_steps > 0:
+        a_accum, g_accum = self._A_accum, self._G_accum
+        if a_accum is not None and g_accum is not None and self._cl_steps > 0:
             with torch.no_grad():
                 for name in self.A:
                     self.A[name] = (
                         self.kfac_ema_decay * self.A[name]
-                        + self._A_accum[name] / self._cl_steps
+                        + a_accum[name] / self._cl_steps
                     )
                     self.G[name] = (
                         self.kfac_ema_decay * self.G[name]
-                        + self._G_accum[name] / self._cl_steps
+                        + g_accum[name] / self._cl_steps
                     )
                 for name, module in self.layers.items():
-                    self.theta_star[name] = module.weight.detach().clone()
+                    self.theta_star[name] = self._weight(module).detach().clone()
         self._A_accum = None
         self._G_accum = None
         self._cl_steps = 0
@@ -186,7 +206,7 @@ class OnlineKFACUpdater(BaseUpdater):
     def _apply_penalty(self) -> float:
         penalty = 0.0
         for name, module in self.layers.items():
-            weight = module.weight
+            weight = self._weight(module)
             diff = (weight.detach() - self.theta_star[name]).reshape(
                 weight.shape[0], -1
             )
