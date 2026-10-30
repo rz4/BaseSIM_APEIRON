@@ -252,6 +252,11 @@ class ContinuousTrainer:
         self.modelHarness.register_task(post_cl_metrics)
 
         transfer: dict[str, Any] = {
+            # The event that produced these numbers. Forward and backward
+            # transfer are per-adaptation quantities, and without this key
+            # the row could not be joined back to the drift event it scores
+            # (claims/LOG.md A31).
+            "drift_event_id": drift_event_id,
             "test_pre_cl_acc": pre_cl_metrics[0],
             "test_curr_acc": post_cl_metrics[0],
             # FWT = R[i][i] - R[i-1][i]: what adapting bought on this window.

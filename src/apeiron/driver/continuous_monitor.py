@@ -155,22 +155,24 @@ class ContinuousMonitor:
     # ----- evaluation -----
 
     def _evaluate_batch(self, batch: Any) -> List[float]:
-        """Evaluate one streamed batch and, past warmup, write it down.
+        """Evaluate one streamed batch and write it down.
 
-        The first ``warmup_iters + 1`` batches ARE evaluated -- the detector
-        needs their metrics -- but are not logged and not profiled, so the cold
-        iterations do not contaminate the FLOP measurements.
+        Every evaluation is logged. Only the post-warmup ones are PROFILED:
+        the two used to be one branch, so the profiler's ``warmup_iters``
+        silently decided how many evaluations reached the metrics file, and
+        raising it to measure more carefully deleted data points from the
+        analysis (claims/LOG.md A66). The measured window now holds the
+        forward pass alone -- what a program measures about itself depends
+        on code placement (R32), and the logger is not part of inference.
         """
         if self.batch_count > self.flops_profiler.warmup_iters:
             with self.flops_profiler.measure_flops(tag="infer"):
                 metrics = self._forward_metrics(batch)
-                self.logger.stage("eval")
-                self.logger.log(
-                    dict(zip(self.modelHarness.eval_metrics, metrics)),
-                )
         else:
             metrics = self._forward_metrics(batch)
 
+        self.logger.stage("eval")
+        self.logger.log(dict(zip(self.modelHarness.eval_metrics, metrics)))
         return metrics
 
     @torch.no_grad()

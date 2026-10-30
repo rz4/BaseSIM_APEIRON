@@ -198,24 +198,14 @@ class TestForwardTransfer:
         assert row["bwt"] == pytest.approx(-10.0)
         assert row["fwt"] == pytest.approx(15.0)
 
-    @pytest.mark.xfail(
-        reason="A31: the row carrying fwt and bwt has no drift_event_id, so it "
-        "cannot be joined to the adaptation that produced it — unlike the "
-        "validation rows and the per-iteration loss rows, which both carry it",
-        strict=True,
-    )
     def test_the_transfer_row_can_be_joined_to_its_event(self, monkeypatch, trainer):
+        """Fixed from A31: fwt and bwt are per-adaptation quantities, and the
+        row now carries the event that produced them, like the validation
+        rows and the per-iteration loss rows always did."""
         row = self._eval_row(
             self._run(monkeypatch, trainer, before=[60.0], after=[75.0])
         )
         assert row["drift_event_id"] == 7
-
-    def test_the_transfer_row_currently_omits_the_event_id(self, monkeypatch, trainer):
-        # present behaviour, recorded so the xfail above has a counterpart
-        row = self._eval_row(
-            self._run(monkeypatch, trainer, before=[60.0], after=[75.0])
-        )
-        assert "drift_event_id" not in row
 
 
 class TestValidationPayload:
